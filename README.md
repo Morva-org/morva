@@ -1,575 +1,85 @@
-# Morva
+# morva
 
-**Your customers are multichain. Your business doesn't have to be.**
+**Every wallet. Every chain. One way to get paid.**
 
-Morva is a cross-chain payment acceptance layer that lets merchants accept payments from supported crypto assets and networks while settling in one preferred stablecoin on Monad.
+Morva lets any business get paid by anyone holding crypto, from any wallet, on any chain, in the currency the business wants. Built on NEAR Intents.
 
-A customer can pay with an asset they already hold — for example, USDC on Base, USDT on BNB Chain, or another supported route — without manually swapping, bridging, or asking the merchant which network to use.
+> Status: pre-build. The landing page exists, and the payment spike is in progress. The product is being built during the NEAR Hackathon, 1–14 November 2026. Nothing here takes real payments yet.
 
-The merchant receives stablecoin settlement on Monad.
+## The problem
 
-**One checkout. Multiple payment sources. One settlement destination.**
+Demand to pay with crypto is real, but checkout loses people in the gap between holding crypto and spending it:
 
----
+- picking the wrong network;
+- payments that arrive short;
+- refunds that bounce between merchant and processor;
+- having USDC but no gas;
+- signing fear;
+- money scattered across chains.
 
-## The Problem
+NEAR Intents and its 1Click API solve routing: a buyer pays from almost any chain, and the merchant receives the asset they chose. But 1Click is a swap API, not a commerce system. It has no orders, holds, merchant-initiated refunds, splits or reconciliation. That gap is Morva.
 
-Accepting crypto still creates unnecessary friction at checkout.
+## What Morva does
 
-A merchant may want to receive USDC on Monad, while their customers hold funds across different networks:
+| Layer | What it adds |
+| --- | --- |
+| **Pay** | Three ways to pay: wallet, signed intent (including passkeys) and a one-time deposit address for exchanges. Exact-output quotes, so the merchant gets the exact invoice amount. Buyers can combine funds held on several chains |
+| **Commerce** | Orders and receipts. Hold, capture and void through an escrow contract on NEAR. Refund to source, so the buyer gets their original token on their original chain. Revenue splits, webhooks and ledger export |
+| **Ops agent** | A per-merchant Shade Agent that applies policies such as "refund everyone if the event is cancelled" (stretch goal) |
+| **Privacy + agents** | Confidential mode. Later, payments from AI agents (x402 / MPP) |
 
-- USDC on Base
-- USDT on BNB Chain
-- ETH on Ethereum
-- USDC on Arbitrum
-- other supported assets and networks
+Merchant funds settle into the merchant's own NEAR Intents balance, and the merchant can withdraw to any chain. Morva's servers never hold funds.
 
-Today, someone has to absorb that complexity.
+The first market is **crypto events and ticketing**. Organizers need what generic checkouts skip: refunds on cancellation, holds until check-in, splits with co-hosts and clean records.
 
-The merchant can require a specific token and network, forcing customers to swap or bridge before paying.
-
-Or the merchant can accept multiple networks and end up managing fragmented balances, different gas tokens, multiple wallets, and more complicated reconciliation.
-
-Neither is a good payment experience.
-
-A merchant should be able to decide **what they want to receive**, without also dictating **what the customer must pay with**.
-
----
-
-## The Solution
-
-Morva separates **payment acceptance** from **merchant settlement**.
-
-The merchant configures one settlement preference:
-
-> **Receive USDC on Monad.**
-
-Customers can then pay through any source asset and network Morva currently supports.
+## How a payment flows
 
 ```text
-CUSTOMER                         MERCHANT
-
-USDC · Base ───────┐
-USDT · BNB Chain ──┤
-ETH · Ethereum ────┼──► MORVA ───► USDC · Monad
-USDC · Arbitrum ───┤
-Other supported ───┘
+Buyer opens link ─► Morva API creates order ─► 1Click EXACT_OUTPUT quote
+   │                                              (recipient: merchant or escrow,
+   │                                               refundTo, appFees)
+   ├─ wallet / signed intent ──┐
+   └─ deposit address + QR ────┴─► solvers fill ─► escrow (held) or merchant balance
+                                                    │
+                     worker polls 1Click status ◄───┘─► webhook + receipt
+                     late / short / failed ───────────► refund to source
 ```
 
-Morva handles the route between the customer's source funds and the merchant's settlement preference.
-
-The customer does not manually bridge.
-
-The merchant does not maintain balances across every network their customers use.
-
----
-
-## How It Works
-
-### 1. Merchant configures settlement
-
-The merchant creates a Morva account and chooses:
-
-- settlement token
-- Monad settlement address
-- payment amount where applicable
-
-For the MVP, merchants can create payment requests that can be presented as a QR code or shared as a checkout link.
-
-QR and payment links are **interfaces to the same underlying Morva payment request**, not separate payment systems.
-
-### 2. Customer opens checkout
-
-The customer scans the QR or opens the payment link.
-
-Morva displays the purchase amount and available supported payment routes.
-
-For example:
+## Repository
 
 ```text
-FreshMart
-
-Total
-$42.50
-
-Pay with
-
-USDC · Base
-USDT · BNB Chain
-ETH  · Ethereum
-
-[ Pay $42.50 ]
+apps/web            Next.js: landing page; /pay/[id] and /dashboard during the hackathon
+apps/api            Node + Hono API (planned)
+apps/api/worker     pg-boss jobs: status polling, refunds, payouts (planned)
+packages/domain     order model and state machine (planned)
+packages/intents    NEAR Intents 1Click client (planned)
+packages/database   Postgres schema (planned)
+packages/config     shared config (planned)
+contracts/escrow    Rust escrow contract on NEAR (planned)
+agents/ops-agent    Shade Agent (planned, stretch)
+tests/e2e           acceptance tests for failure cases (planned)
+scripts/            Gate 1 payment spike (throwaway research)
+docs/               PRD, execution plan, spike findings
 ```
 
-The customer chooses an asset they already hold.
+Each planned folder has a README covering its purpose and the PRD section it implements.
 
-### 3. Morva routes the payment
-
-Morva uses Aurora Intents to execute the cross-chain payment from the customer's source network toward the merchant's required settlement on Monad.
-
-The customer does not need to manually:
-
-- bridge assets
-- swap into the merchant's token
-- switch to the merchant's network
-- understand the merchant's treasury setup
-
-### 4. Merchant receives settlement on Monad
-
-The merchant receives the configured stablecoin on Monad regardless of the supported source route used by the customer.
-
-Morva never takes custody of merchant funds.
-
-### 5. Morva independently verifies payment
-
-A successful wallet response or intent status is not considered proof of payment.
-
-Envio indexes the final Monad settlement.
-
-The Morva backend independently verifies:
-
-- destination chain
-- settlement token
-- recipient
-- amount
-- transaction identity
-- associated payment request
-
-Only after the onchain settlement matches the expected payment does Morva mark the payment as complete.
-
-Both the customer and merchant can then receive real-time confirmation.
-
----
-
-## Why Morva?
-
-### For customers
-
-**Pay with what you already have.**
-
-Customers should not need to understand bridges, destination networks, or merchant treasury preferences just to make a payment.
-
-### For merchants
-
-**Accept crypto without becoming multichain.**
-
-Merchants configure one settlement destination instead of maintaining operational balances across every network their customers use.
-
-### For checkout
-
-**Crypto becomes a payment method, not a routing problem.**
-
-The checkout experience hides the infrastructure required to move value between the customer's source asset and the merchant's settlement asset.
-
----
-
-## Why Monad?
-
-Monad is Morva's settlement layer.
-
-Rather than leaving merchants with fragmented balances across multiple networks, Morva normalizes supported incoming payments into a consistent stablecoin settlement environment on Monad.
-
-This gives the merchant one place for:
-
-- settlement
-- transaction history
-- reconciliation
-- future programmable payment logic
-
-The long-term goal is for Monad to become more than Morva's destination chain. It becomes the programmable financial layer behind merchant payments.
-
-Future settlement rules can support flows such as:
-
-```text
-Customer payment
-       │
-       ▼
-     Monad
-       │
-       ├──► Merchant
-       ├──► Supplier
-       ├──► Operations
-       └──► Reserve
-```
-
-A customer still makes one payment, while the merchant can define what happens to the money after settlement.
-
----
-
-## Why Aurora Intents?
-
-Aurora Intents provides the cross-chain execution layer behind Morva's checkout.
-
-It answers a different question from Monad:
-
-> **Aurora Intents: Where can the customer pay from?**
-
-> **Monad: Where and how does the merchant settle?**
-
-Morva combines these layers into one merchant payment experience.
-
-Only source chains, assets, and routes verified through live testing will be exposed in the product.
-
----
-
-## Payment Interfaces
-
-Morva is not a QR payment product.
-
-A **Morva payment request** is the underlying primitive.
-
-For the hackathon MVP, that request can be accessed through:
-
-### QR Checkout
-
-Designed for physical merchant checkout.
-
-A merchant can display a Morva QR that opens the payment experience for the customer.
-
-### Payment Links
-
-A merchant can share the same checkout through messaging apps, email, invoices, social platforms, or websites.
-
-The same architecture can later support:
-
-- POS integrations
-- ecommerce checkout
-- NFC
-- merchant APIs
-- embedded checkout
-- invoices
-
-without changing Morva's settlement model.
-
----
-
-## Architecture
-
-```text
-                    MORVA
-
-               Payment Request
-                     │
-          ┌──────────┴──────────┐
-          │                     │
-         QR                Payment Link
-          │                     │
-          └──────────┬──────────┘
-                     │
-                     ▼
-              Morva Checkout
-                     │
-                     ▼
-          Customer Source Asset
-                     │
-                     ▼
-              Aurora Intents
-                     │
-             Cross-chain route
-                     │
-                     ▼
-                   Monad
-                     │
-                     ▼
-          Merchant Stablecoin
-                     │
-                     ▼
-                  Envio
-                     │
-             Verify settlement
-                     │
-                     ▼
-                Payment Paid
-```
-
----
-
-## Repository Structure
-
-```text
-morva/
-├── apps/
-│   ├── web/          Merchant dashboard and customer checkout
-│   ├── api/          Payment requests, verification and state
-│   └── indexer/      Envio settlement indexing
-│
-├── packages/
-│   ├── domain/       Payment types, validation and state machines
-│   ├── database/     Database schemas and persistence
-│   └── config/       Shared workspace configuration
-│
-├── contracts/        Monad settlement contracts if required
-├── tests/
-│   └── e2e/          End-to-end payment tests
-└── docs/             Architecture and execution documentation
-```
-
-### `apps/web`
-
-Contains the merchant dashboard and public checkout.
-
-The web application can initiate payment and verification requests but cannot independently mark a payment as successful.
-
-### `apps/api`
-
-Owns payment-request metadata, verification coordination, and payment state transitions.
-
-The API does not custody funds or store payment private keys.
-
-### `apps/indexer`
-
-Contains the Envio configuration and handlers used to observe settlement activity on Monad.
-
-### `packages/domain`
-
-Contains shared payment types, amount handling, expiry rules, route information, and payment-state logic.
-
-### `packages/database`
-
-Contains schemas, migrations, uniqueness constraints, and persistence interfaces.
-
-### `tests/e2e`
-
-Tests complete flows including successful settlement, incorrect amounts, mismatched recipients, duplicate transactions, replay attempts, and expired payment requests.
-
----
-
-## Technology
-
-| Technology | Role |
-|---|---|
-| **Monad** | Merchant settlement layer |
-| **Aurora Intents** | Cross-chain payment routing |
-| **Envio** | Monad settlement indexing and verification |
-| **Dynamic** | Authentication, wallet connectivity and signing |
-| **Next.js** | Merchant dashboard and customer checkout |
-| **TypeScript** | Application and backend development |
-| **PostgreSQL** | Merchant, payment and settlement metadata |
-
----
-
-## Security & Non-Custodial Design
-
-Morva does not custody merchant funds.
-
-Funds move from the customer's payment route to the merchant's configured Monad settlement destination.
-
-Morva's backend does not:
-
-- store customer private keys
-- store merchant private keys
-- sign payments on behalf of users
-- treat frontend callbacks as settlement proof
-
-### Payment verification
-
-Morva does **not** consider any of the following sufficient proof of payment:
-
-- browser success state
-- wallet callback
-- buyer-submitted transaction hash
-- intent completion response alone
-
-A payment becomes `paid` only after Morva independently observes and validates the expected Monad settlement through Envio.
-
-Verification checks include:
-
-```text
-chain
-recipient
-token
-amount
-transaction identity
-payment request
-```
-
-Database uniqueness constraints prevent the same settlement transaction from being used to satisfy multiple payment requests.
-
----
-
-## Payment State
-
-The initial payment lifecycle is intentionally small:
-
-```text
-PENDING
-   │
-   ├────────► EXPIRED
-   │
-   ▼
-PROCESSING
-   │
-   ▼
-PAID
-```
-
-`PAID` and `EXPIRED` are terminal states for the MVP.
-
-Failed, delayed, or unverifiable settlement never results in Morva marking the payment as paid.
-
----
-
-## Hackathon MVP
-
-The Metropolis version of Morva focuses on proving one experience exceptionally well:
-
-> **A merchant accepts a payment from a customer on another supported network and receives stablecoin settlement on Monad without either party manually bridging or swapping.**
-
-The MVP includes:
-
-- merchant onboarding
-- Monad settlement preference
-- fixed-amount payment requests
-- QR checkout
-- shareable payment links
-- Dynamic authentication and wallet signing
-- tested Aurora Intents source routes
-- stablecoin settlement on Monad
-- Envio-backed independent settlement verification
-- merchant payment dashboard
-- pending, processing, paid, and expired states
-- transaction receipts
-- end-to-end payment testing
-
-Supported source chains and assets are intentionally limited to routes proven reliable through live Aurora Intents testing.
-
----
-
-## Demo Flow
-
-The hackathon demo follows one simple payment:
-
-```text
-1. Merchant creates a $25 payment request
-
-                     ↓
-
-2. Customer opens Morva checkout
-
-                     ↓
-
-3. Customer selects USDC on Base
-
-                     ↓
-
-4. Aurora Intents routes the payment
-
-                     ↓
-
-5. Merchant receives USDC on Monad
-
-                     ↓
-
-6. Envio independently observes settlement
-
-                     ↓
-
-7. Merchant checkout changes to:
-
-                  ✓ PAID
-```
-
-The merchant never manages Base.
-
-The customer never manually moves funds to Monad.
-
----
-
-## Current Status
-
-Morva currently has a responsive frontend and simulated checkout experience.
-
-The next implementation milestones are:
-
-1. Validate Aurora Intents → Monad routes, supported assets, fees, and settlement latency
-2. Finalize the Monad settlement stablecoin and network environment
-3. Implement merchant onboarding and settlement configuration
-4. Implement real payment requests
-5. Integrate Dynamic wallet authentication and signing
-6. Execute the first real cross-chain payment
-7. Implement Envio settlement indexing
-8. Add backend verification and payment-state transitions
-9. Build merchant payment history and receipts
-10. Complete end-to-end tests using real transactions
-
-The cross-chain feasibility spike comes first. Morva will not advertise a source asset or network until the complete route has been successfully tested.
-
----
-
-## What's Next
-
-The MVP proves cross-chain merchant acceptance.
-
-The broader Morva vision is a **universal merchant acceptance layer** where businesses integrate once and customers pay from whichever supported financial rail they use.
-
-Future interfaces can include:
-
-- POS integrations
-- ecommerce checkout
-- NFC payments
-- invoices
-- merchant APIs
-- embedded checkout
-
-Monad can also enable programmable settlement rules such as:
-
-- automatic revenue splits
-- supplier payouts
-- treasury allocation
-- reserves
-- recurring payments
-- refunds
-- conditional settlement
-
-The interface can evolve.
-
-The underlying principle remains the same:
-
-> **Customers choose how they pay. Merchants choose how they receive. Morva handles everything between them.**
-
----
-
-## Local Development
-
-Install dependencies and start the web application:
+## Getting started
 
 ```sh
 npm ci
-npm run dev
-```
-
-Open:
-
-```text
-http://localhost:3000
-```
-
-Run a production build:
-
-```sh
+npm run dev              # landing page at http://localhost:3000
 npm run build
-```
-
-Run TypeScript validation:
-
-```sh
 npm run typecheck
+
+cp .env.example .env     # for the spike only
+npm run spike:payments -- --test=1   # dry 1Click quote, moves no funds
+npm run test:spike
 ```
 
-Environment configuration will include:
+## Docs
 
-- Monad RPC endpoint and chain ID
-- Aurora Intents configuration
-- Envio configuration
-- Dynamic environment ID
-- PostgreSQL connection string
-- authentication configuration
-- public web and API URLs
-
-Never commit live credentials.
-
----
-
-## License
-
-A project license will be added before public distribution or external contributions.
+- [PRD v2](docs/Morva_PRD_v2.pdf): the source of truth.
+- [Execution plan](docs/EXECUTION_PLAN.md): the hackathon schedule, cut list and open decisions.
+- [Payment spike](docs/PAYMENT_SPIKE.md): what the 1Click API actually does, and where that differs from the PRD.
+- [Brand](brand.md).
