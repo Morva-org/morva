@@ -1,0 +1,321 @@
+// The Morva API: merchant sign-up and login with passkeys, sessions, email verification.
+// Passkey private keys never leave the merchant's device; the server stores public keys only.
+import { createHash, createHmac, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
+import { Hono, type Context } from "hono";
+import { deleteCookie, getCookie, setCookie } from "hono/cookie";
+import {
+  generateAuthenticationOptions,
+  generateRegistrationOptions,
+  verifyAuthenticationResponse,
+  verifyRegistrationResponse,
+  type AuthenticationResponseJSON,
+  type RegistrationResponseJSON,
+} from "@simplewebauthn/server";
+import { cose, decodeCredentialPublicKey } from "@simplewebauthn/server/helpers";
+import {
+  consumeChallenge,
+  createChallenge,
+  createEmailCode,
+  createMerchantWithPasskey,
+  createSession,
+  deleteSession,
+  findPasskeyByCredentialId,
+  getMerchant,
+  getSessionMerchant,
+  isHandleTaken,
+  latestEmailCode,
+  listPasskeys,
+  recordAudit,
+  recordEmailCodeAttempt,
+  recordPasskeyUse,
+  setContactEmail,
+  type Db,
+  type Merchant,
+} from "@morva/database";
+import { normalizeHandle, validateHandle } from "@morva/domain";
+import { p256AccountId, p256PublicKeyString, rawP256FromCoordinates } from "@morva/intents";
+import type { Config } from "./config.ts";
+import type { Mailer } from "./mailer.ts";
+import { LIMITS, RateLimiter, type Limit } from "./rate-limit.ts";
+
+export const SESSION_COOKIE = "morva_session";
+const ES256 = -7;
+const CHALLENGE_TTL_MS = 5 * 60_000;
+const EMAIL_CODE_TTL_MS = 10 * 60_000;
+const EMAIL_CODE_ATTEMPTS = 5;
+
+type Env = { Variables: { merchant: Merchant; ip: string } };
+
+export interface Deps {
+  db: Db;
+  config: Config;
+  mailer: Mailer;
+  limiter?: RateLimiter;
+}
+
+const sha256 = (data: string | Uint8Array) => createHash("sha256").update(data).digest();
+const b64url = (bytes: Uint8Array) => Buffer.from(bytes).toString("base64url");
+
+export function createApp({ db, config, mailer, limiter = new RateLimiter() }: Deps) {
+  const app = new Hono<Env>();
+
+  // Client IP, for rate limits. Behind a proxy, only trusted when configured.
+  app.use("*", async (c, next) => {
+    const forwarded = config.trustProxy ? c.req.header("x-forwarded-for")?.split(",")[0]?.trim() : undefined;
+    const incoming = (c.env as { incoming?: { socket?: { remoteAddress?: string } } } | undefined)?.incoming;
+    c.set("ip", forwarded || incoming?.socket?.remoteAddress || "unknown");
+    await next();
+  });
+
+  // CSRF: state-changing requests must come from the web app's own origin.
+  app.use("/v1/*", async (c, next) => {
+    if (c.req.method !== "GET" && c.req.method !== "HEAD" && c.req.header("origin") !== config.webOrigin) {
+      return c.json({ error: "forbidden_origin" }, 403);
+    }
+    await next();
+  });
+
+  app.onError((err, c) => {
+    console.error(err);
+    return c.json({ error: "internal" }, 500);
+  });
+
+  const limit = (c: Context<Env>, name: keyof typeof LIMITS, key: string, l: Limit = LIMITS[name]) => {
+    const r = limiter.hit(`${name}:${key}`, l);
+    if (r.ok) return null;
+    c.header("Retry-After", String(r.retryAfter));
+    return c.json({ error: "rate_limited", retry_after: r.retryAfter }, 429);
+  };
+
+  const startSession = async (c: Context<Env>, merchantId: string) => {
+    const token = randomBytes(32);
+    const expires = new Date(Date.now() + config.sessionDays * 86_400_000);
+    await createSession(db, sha256(token), merchantId, expires, c.req.header("user-agent") ?? null);
+    setCookie(c, SESSION_COOKIE, b64url(token), {
+      httpOnly: true,
+      secure: config.secureCookies,
+      sameSite: "Lax",
+      path: "/",
+      expires,
+    });
+  };
+
+  const sessionHash = (c: Context<Env>) => {
+    const token = getCookie(c, SESSION_COOKIE);
+    return token ? sha256(Buffer.from(token, "base64url")) : null;
+  };
+
+  const requireMerchant = async (c: Context<Env>, next: () => Promise<void>) => {
+    const hash = sessionHash(c);
+    const merchant = hash ? await getSessionMerchant(db, hash) : null;
+    if (!merchant) return c.json({ error: "unauthenticated" }, 401);
+    c.set("merchant", merchant);
+    await next();
+  };
+
+  // --- sign-up: create a passkey, derive the merchant's NEAR Intents account -------------
+
+  app.post("/v1/auth/register/options", async c => {
+    const limited = limit(c, "register", c.get("ip"));
+    if (limited) return limited;
+    const userId = randomBytes(16);
+    const options = await generateRegistrationOptions({
+      rpName: config.rpName,
+      rpID: config.rpId,
+      userName: "Morva merchant",
+      userDisplayName: "Morva merchant",
+      userID: userId,
+      attestationType: "none",
+      authenticatorSelection: { residentKey: "required", userVerification: "required" },
+      supportedAlgorithmIDs: [ES256],
+    });
+    const challengeId = await createChallenge(db, {
+      purpose: "register",
+      challenge: options.challenge,
+      userHandle: b64url(userId),
+      expiresAt: new Date(Date.now() + CHALLENGE_TTL_MS),
+    });
+    return c.json({ challengeId, options });
+  });
+
+  app.post("/v1/auth/register/verify", async c => {
+    const limited = limit(c, "register", c.get("ip"));
+    if (limited) return limited;
+    const body = await c.req.json<{ challengeId?: string; response?: RegistrationResponseJSON; deviceLabel?: string }>().catch(() => ({}) as never);
+    if (!body.challengeId || !body.response) return c.json({ error: "invalid_request" }, 400);
+    const challenge = await consumeChallenge(db, body.challengeId, "register");
+    if (!challenge) return c.json({ error: "challenge_expired" }, 400);
+
+    let verification;
+    try {
+      verification = await verifyRegistrationResponse({
+        response: body.response,
+        expectedChallenge: challenge.challenge,
+        expectedOrigin: config.webOrigin,
+        expectedRPID: config.rpId,
+        requireUserVerification: true,
+        supportedAlgorithmIDs: [ES256],
+      });
+    } catch {
+      return c.json({ error: "passkey_rejected" }, 400);
+    }
+    if (!verification.verified) return c.json({ error: "passkey_rejected" }, 400);
+    const { credential, credentialBackedUp } = verification.registrationInfo;
+
+    // The passkey's public key defines the merchant's NEAR Intents account (PAYMENT_SPIKE finding 13).
+    const key = decodeCredentialPublicKey(credential.publicKey);
+    const x = key.get(cose.COSEKEYS.x as never) as Uint8Array | undefined;
+    const y = key.get(cose.COSEKEYS.y as never) as Uint8Array | undefined;
+    if (key.get(cose.COSEKEYS.alg) !== ES256 || !x || !y) return c.json({ error: "unsupported_key" }, 400);
+    const raw = rawP256FromCoordinates(x, y);
+
+    if (await findPasskeyByCredentialId(db, credential.id)) return c.json({ error: "passkey_exists" }, 409);
+    const { merchant } = await createMerchantWithPasskey(db, p256AccountId(raw), {
+      credentialId: credential.id,
+      publicKey: credential.publicKey,
+      publicKeyP256: p256PublicKeyString(raw),
+      signCount: credential.counter,
+      transports: credential.transports ?? [],
+      backedUp: credentialBackedUp,
+      deviceLabel: body.deviceLabel?.slice(0, 60) ?? null,
+    });
+    await startSession(c, merchant.id);
+    return c.json({ merchant: publicMerchant(merchant) }, 201);
+  });
+
+  // --- log in with a passkey -----------------------------------------------------------
+
+  app.post("/v1/auth/login/options", async c => {
+    const limited = limit(c, "login", c.get("ip"));
+    if (limited) return limited;
+    // Discoverable credentials: the browser offers whichever Morva passkeys are on the device.
+    const options = await generateAuthenticationOptions({ rpID: config.rpId, userVerification: "required", allowCredentials: [] });
+    const challengeId = await createChallenge(db, { purpose: "login", challenge: options.challenge, expiresAt: new Date(Date.now() + CHALLENGE_TTL_MS) });
+    return c.json({ challengeId, options });
+  });
+
+  app.post("/v1/auth/login/verify", async c => {
+    const limited = limit(c, "login", c.get("ip"));
+    if (limited) return limited;
+    const body = await c.req.json<{ challengeId?: string; response?: AuthenticationResponseJSON }>().catch(() => ({}) as never);
+    if (!body.challengeId || !body.response) return c.json({ error: "invalid_request" }, 400);
+    const challenge = await consumeChallenge(db, body.challengeId, "login");
+    if (!challenge) return c.json({ error: "challenge_expired" }, 400);
+    const passkey = await findPasskeyByCredentialId(db, body.response.id);
+    if (!passkey) return c.json({ error: "passkey_unknown" }, 401);
+
+    let verification;
+    try {
+      verification = await verifyAuthenticationResponse({
+        response: body.response,
+        expectedChallenge: challenge.challenge,
+        expectedOrigin: config.webOrigin,
+        expectedRPID: config.rpId,
+        credential: { id: passkey.credential_id, publicKey: new Uint8Array(passkey.public_key), counter: passkey.sign_count, transports: passkey.transports },
+        requireUserVerification: true,
+      });
+    } catch {
+      return c.json({ error: "passkey_rejected" }, 401);
+    }
+    if (!verification.verified) return c.json({ error: "passkey_rejected" }, 401);
+    await recordPasskeyUse(db, passkey.id, verification.authenticationInfo.newCounter);
+    await recordAudit(db, passkey.merchant_id, "login", { credential_id: passkey.credential_id });
+    await startSession(c, passkey.merchant_id);
+    const merchant = await getMerchant(db, passkey.merchant_id);
+    return c.json({ merchant: publicMerchant(merchant!) });
+  });
+
+  app.post("/v1/auth/logout", async c => {
+    const hash = sessionHash(c);
+    if (hash) await deleteSession(db, hash);
+    deleteCookie(c, SESSION_COOKIE, { path: "/", secure: config.secureCookies });
+    return c.json({ ok: true });
+  });
+
+  // --- the signed-in merchant ----------------------------------------------------------
+
+  app.get("/v1/me", requireMerchant, async c => {
+    const merchant = c.get("merchant");
+    const passkeys = await listPasskeys(db, merchant.id);
+    return c.json({
+      merchant: publicMerchant(merchant),
+      passkeys: passkeys.map(p => ({ id: p.id, device_label: p.device_label, created_at: p.created_at, last_used_at: p.last_used_at, backed_up: p.backed_up })),
+    });
+  });
+
+  // Handle availability, for the live check on the business screen.
+  app.get("/v1/handles/:handle", async c => {
+    const limited = limit(c, "handleCheck", c.get("ip"));
+    if (limited) return limited;
+    const handle = normalizeHandle(c.req.param("handle"));
+    const valid = validateHandle(handle);
+    if (!valid.ok) return c.json({ handle, available: false, reason: valid.problem, message: valid.message });
+    const hash = sessionHash(c);
+    const me = hash ? await getSessionMerchant(db, hash) : null;
+    const taken = await isHandleTaken(db, handle, me?.id);
+    return c.json({ handle, available: !taken, ...(taken ? { reason: "taken", message: "That name is taken. Try another." } : {}) });
+  });
+
+  // --- contact email: for notifications and recovery contact; it can never move funds --------
+
+  app.post("/v1/me/email", requireMerchant, async c => {
+    const merchant = c.get("merchant");
+    const limited = limit(c, "emailSend", merchant.id);
+    if (limited) return limited;
+    const { email } = await c.req.json<{ email?: string }>().catch(() => ({}) as { email?: string });
+    const clean = email?.trim().toLowerCase() ?? "";
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(clean) || clean.length > 254) return c.json({ error: "invalid_email" }, 400);
+    const code = String(randomInt(0, 1_000_000)).padStart(6, "0");
+    await createEmailCode(db, merchant.id, clean, emailCodeHash(config, merchant.id, code), new Date(Date.now() + EMAIL_CODE_TTL_MS));
+    await mailer.sendVerificationCode(clean, code);
+    return c.json({ sent: true });
+  });
+
+  app.post("/v1/me/email/verify", requireMerchant, async c => {
+    const merchant = c.get("merchant");
+    const limited = limit(c, "emailVerify", merchant.id);
+    if (limited) return limited;
+    const { code } = await c.req.json<{ code?: string }>().catch(() => ({}) as { code?: string });
+    const pending = await latestEmailCode(db, merchant.id);
+    if (!pending || pending.expires_at.getTime() < Date.now() || pending.attempts >= EMAIL_CODE_ATTEMPTS) {
+      return c.json({ error: "code_expired" }, 400);
+    }
+    const ok = typeof code === "string" && /^\d{6}$/.test(code) && timingSafeEqual(Buffer.from(pending.code_hash), emailCodeHash(config, merchant.id, code));
+    await recordEmailCodeAttempt(db, pending.id, ok);
+    if (!ok) return c.json({ error: "code_wrong", attempts_left: EMAIL_CODE_ATTEMPTS - pending.attempts - 1 }, 400);
+    await setContactEmail(db, merchant.id, pending.email);
+    return c.json({ verified: true, email: pending.email });
+  });
+
+  return app;
+}
+
+function emailCodeHash(config: Config, merchantId: string, code: string): Buffer {
+  return createHmac("sha256", config.sessionSecret).update(`${merchantId}:${code}`).digest();
+}
+
+/** What the web app may see about a merchant. */
+export function publicMerchant(m: Merchant) {
+  return {
+    id: m.id,
+    handle: m.handle,
+    business_name: m.business_name,
+    logo_url: m.logo_url,
+    country: m.country,
+    contact_email: m.contact_email,
+    contact_email_verified: Boolean(m.contact_email_verified_at),
+    intents_account_id: m.intents_account_id,
+    settlement_asset: m.settlement_asset,
+    payout_mode: m.payout_mode,
+    payout_chain: m.payout_chain,
+    payout_address: m.payout_address,
+    payout_threshold: m.payout_threshold,
+    refund_policy_default: m.refund_policy_default,
+    hold_by_default: m.hold_by_default,
+    confidential_default: m.confidential_default,
+    sales_channels: m.sales_channels,
+    terms_accepted: Boolean(m.terms_accepted_at),
+    onboarding_step: m.onboarding_step,
+    live: Boolean(m.live_at),
+  };
+}

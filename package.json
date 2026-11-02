@@ -3,7 +3,10 @@
   "private": true,
   "workspaces": [
     "apps/web",
-    "packages/intents"
+    "apps/api",
+    "packages/intents",
+    "packages/domain",
+    "packages/database"
   ],
   "scripts": {
     "spike:payments": "node scripts/payment-spike.mjs",

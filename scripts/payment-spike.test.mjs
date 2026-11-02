@@ -109,3 +109,13 @@ test("erc191 signatures normalize v to 0/1 for the Verifier", async () => {
   assert.equal(await recoverMessageAddress({ message: "{\"signer_id\":\"x\"}", signature: hex }), account.address);
   assert.throws(() => erc191Signature("0x1234"), /65-byte/);
 });
+
+test("live runs refuse without a spending cap, and refuse quotes above it", async () => {
+  const { assertTestSpend, testSpendCap } = await import("./test-spend.mjs");
+  assert.throws(() => testSpendCap({}), /MAX_TEST_SPEND_USD/);
+  assert.throws(() => testSpendCap({ MAX_TEST_SPEND_USD: "0" }), /MAX_TEST_SPEND_USD/);
+  assert.equal(assertTestSpend("2.03", "quote", { MAX_TEST_SPEND_USD: "5" }), 2.03);
+  assert.throws(() => assertTestSpend("5.01", "quote", { MAX_TEST_SPEND_USD: "5" }), /above MAX_TEST_SPEND_USD/);
+  assert.throws(() => assertTestSpend(undefined, "quote", { MAX_TEST_SPEND_USD: "5" }), /refusing/i);
+  await assert.rejects(run(["--test=1", "--live"], { SPIKE_TRON_REFUND_ADDRESS: "T", SPIKE_MERCHANT_INTENTS_ACCOUNT: "m" }, async () => new Response("[]")), /MAX_TEST_SPEND_USD/);
+});

@@ -2,6 +2,7 @@
 // Usage: npm run spike:payments -- --test=1 [--live] [--amount=1000000] [--deposit-address=...]
 // Without --live every quote is dry: no deposit address is created and nothing can move funds.
 import { pathToFileURL } from "node:url";
+import { assertTestSpend, testSpendCap } from "./test-spend.mjs";
 
 export const ONECLICK = "https://1click.chaindefuser.com";
 export const VERIFIER = "intents.near";
@@ -215,6 +216,17 @@ async function test5(api, tokens, args, env) {
 export async function run(argv, env = process.env, fetcher = fetch) {
   const args = parseArgs(argv);
   const api = client({ apiKey: env.ONECLICK_API_KEY, fetcher });
+  // Live (non-dry) quotes are the only path to spending real money: cap them before anything is
+  // deposited or signed. MAX_TEST_SPEND_USD is required for --live.
+  if (args.live) {
+    testSpendCap(env);
+    const quote = api.quote;
+    api.quote = async body => {
+      const result = await quote(body);
+      if (body.dry === false) assertTestSpend(result.quote?.amountInUsd, "This quote", env);
+      return result;
+    };
+  }
   if (!env.ONECLICK_API_KEY) console.warn("ONECLICK_API_KEY not set: quotes are unauthenticated and carry an extra 25 bps fee.");
   const tokens = await api.tokens();
   return [test1, test2, test3, test4, test5][args.test - 1](api, tokens, args, env);

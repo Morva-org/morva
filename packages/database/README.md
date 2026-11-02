@@ -1,25 +1,24 @@
 # Database package
 
-Planned: built from 1 November 2026.
+Postgres schema, migrations and typed queries. PRD §13.
 
-## Purpose
+- **`migrations/*.sql`:** applied in order by `migrate(db)`, each in a transaction. Recorded in `schema_migration`.
+- **`src/db.ts`:** a minimal `Db` interface. `connectPostgres(url)` uses node-postgres in production. `connectMemory()` uses PGlite, the same Postgres engine in-process, for tests.
+- **`src/repo.ts`:** queries for merchants, passkeys, sessions, WebAuthn challenges, email codes and the audit log.
 
-The Postgres schema, migrations and repository functions for the API and worker. Order state changes are written here inside transactions, and the ledger is append-only.
+Tables so far:
+- `merchant`
+- `passkey`
+- `api_key` (hash only)
+- `webhook_endpoint` (signing secret encrypted, since it must be recoverable to sign)
+- `audit_event`
+- `session` (token hash only)
+- `webauthn_challenge` (single use)
+- `email_code` (HMAC only)
 
-## What it will contain
+There's no `near_account_id`: `intents_account_id` is derived from the merchant's first passkey and never changes.
 
-Tables for the PRD entities:
-
-- `merchant`: NEAR Intents account, settlement asset and chain, payout address, confidential default, policies.
-- `product` / `ticket_type`, `payment_link`.
-- `order`, `payment` (origin asset, chain and address, deposit address, quote ID and signature, tx hashes).
-- `gather_leg`: one row per source chain in a unified-balance payment.
-- `refund`, `split`, `ledger_entry` (capture, refund, fee, split).
-- `webhook_endpoint` / `webhook_event`.
-- pg-boss also uses this database for its job tables.
-
-Saved quotes keep the full 1Click quote response and its `signature`, which the docs say must be kept to resolve disputes.
-
-## PRD sections
-
-§13 Data model, §11 System architecture (Postgres, pg-boss).
+```sh
+npm run migrate --workspace=@morva/database   # uses DATABASE_URL
+npm test --workspace=@morva/database
+```

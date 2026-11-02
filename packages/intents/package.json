@@ -14,5 +14,8 @@
     "@types/node": "^24.0.0",
     "typescript": "^5.9.0",
     "viem": "2.56.9"
+  },
+  "dependencies": {
+    "@noble/hashes": "2.4.0"
   }
 }

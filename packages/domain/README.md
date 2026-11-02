@@ -1,6 +1,6 @@
 # Domain package
 
-Planned: built from 1 November 2026.
+Built so far: merchant handle rules (`src/handle.ts`) and the money-action policy (`src/money-actions.ts`). Withdrawals and payout changes over $100 need a backup passkey first. The order model and state machine below are next.
 
 ## Purpose
 
