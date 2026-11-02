@@ -11,6 +11,8 @@ export interface Config {
   /** Take the client IP from X-Forwarded-For (only behind a trusted proxy). */
   trustProxy: boolean;
   sessionDays: number;
+  /** Google sign-in; off when unset. `fetch` is for tests. */
+  google?: { clientId: string; clientSecret: string; fetch?: typeof fetch } | null;
 }
 
 export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Config {
@@ -29,5 +31,6 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Config {
     secureCookies: env.INSECURE_COOKIES !== "1",
     trustProxy: env.TRUST_PROXY === "1",
     sessionDays: Number(env.SESSION_DAYS || 30),
+    google: env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET ? { clientId: env.GOOGLE_CLIENT_ID, clientSecret: env.GOOGLE_CLIENT_SECRET } : null,
   };
 }

@@ -8,10 +8,11 @@ const fresh: OnboardingState = {
   country: null,
   contact_email_verified: false,
   terms_accepted: false,
+  has_passkey: false,
   onboarding_step: "business",
   live: false,
 };
-const done: OnboardingState = { ...fresh, handle: "northside", business_name: "Northside Events", country: "NG", contact_email_verified: true, terms_accepted: true };
+const done: OnboardingState = { ...fresh, handle: "northside", business_name: "Northside Events", country: "NG", contact_email_verified: true, terms_accepted: true, has_passkey: true };
 
 describe("onboarding steps", () => {
   it("walks the steps in order, with no way back past the first", () => {
@@ -27,12 +28,16 @@ describe("onboarding steps", () => {
     assert.equal(r.ok, false);
     if (!r.ok) assert.match(r.message, /business name/);
     assert.deepEqual(canAdvance({ ...fresh, handle: "n", business_name: "N", country: "NG" }, "business"), { ok: true, to: "email" });
+    assert.deepEqual(canAdvance({ ...fresh, handle: "n", business_name: "N", country: "NG", contact_email_verified: true }, "business"), { ok: true, to: "payout" }, "email from sign-up is passed over");
+    assert.equal(canAdvance({ ...done, has_passkey: false }, "secure").ok, false);
+    assert.deepEqual(canAdvance(done, "defaults"), { ok: true, to: "backup" }, "a passkey from sign-up passes over secure");
     assert.equal(canAdvance({ ...done, contact_email_verified: false }, "email").ok, false);
     assert.equal(canAdvance({ ...done, terms_accepted: false }, "terms").ok, false);
   });
 
   it("lets the backup device and the test payment be skipped, and nothing else", () => {
     assert.deepEqual(canAdvance(fresh, "backup", { skip: true }), { ok: true, to: "terms" });
+    assert.equal(canAdvance(fresh, "secure", { skip: true }).ok, false, "the passkey can't be skipped");
     assert.deepEqual(canAdvance(fresh, "test_payment", { skip: true }), { ok: true, to: "live" });
     for (const step of ["business", "email", "terms"] as const) assert.equal(canAdvance(fresh, step, { skip: true }).ok, false, step);
   });
@@ -48,6 +53,7 @@ describe("onboarding steps", () => {
     assert.deepEqual(canGoLive(done), { ok: true });
     assert.equal(canGoLive({ ...done, terms_accepted: false }).ok, false);
     assert.equal(canGoLive({ ...done, handle: null }).ok, false);
+    assert.equal(canGoLive({ ...done, has_passkey: false }).ok, false);
   });
 });
 

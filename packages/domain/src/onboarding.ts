@@ -1,11 +1,17 @@
-// The merchant onboarding steps after the passkey exists (welcome and passkey are before any
-// account). The server stores the furthest step reached; the client resumes from it.
+// The merchant onboarding steps after sign-up (email code, Google or passkey). The server stores
+// the furthest step reached; the client resumes from it.
+//
+// "secure" creates the passkey that controls the merchant's balance. Email and Google sign-in
+// reach the dashboard only; money always needs a passkey, so going live needs one.
 
-export const ONBOARDING_STEPS = ["business", "email", "payout", "channels", "defaults", "backup", "terms", "test_payment", "live"] as const;
+export const ONBOARDING_STEPS = ["business", "email", "payout", "channels", "defaults", "secure", "backup", "terms", "test_payment", "live"] as const;
 export type OnboardingStep = (typeof ONBOARDING_STEPS)[number];
 
 /** Steps a merchant may skip. Everything else needs an answer. */
 export const SKIPPABLE: ReadonlySet<OnboardingStep> = new Set(["backup", "test_payment"]);
+
+/** Steps passed over automatically once done: an email from sign-up, or a passkey from sign-up. */
+const AUTO_PASS: ReadonlySet<OnboardingStep> = new Set(["email", "secure"]);
 
 /** What the step machine needs to know about a merchant. */
 export interface OnboardingState {
@@ -14,6 +20,7 @@ export interface OnboardingState {
   country: string | null;
   contact_email_verified: boolean;
   terms_accepted: boolean;
+  has_passkey: boolean;
   onboarding_step: string;
   live: boolean;
 }
@@ -45,6 +52,8 @@ export function stepComplete(step: OnboardingStep, m: OnboardingState): { ok: tr
       return m.contact_email_verified ? { ok: true } : { ok: false, message: "Confirm your email with the code we sent." };
     case "terms":
       return m.terms_accepted ? { ok: true } : { ok: false, message: "Accept the terms to continue." };
+    case "secure":
+      return m.has_passkey ? { ok: true } : { ok: false, message: "Create your passkey to protect your balance." };
     default:
       // Payout, channels and defaults always have a valid saved value (their defaults);
       // backup and test payment are skippable.
@@ -62,7 +71,14 @@ export function resumeStep(m: OnboardingState): OnboardingStep {
   for (const step of ONBOARDING_STEPS.slice(0, index(reached))) {
     if (!stepComplete(step, m).ok) return step;
   }
-  return reached;
+  return passCompleted(reached, m);
+}
+
+/** Moves past steps that are already done and need no answer (see AUTO_PASS). */
+export function passCompleted(step: OnboardingStep, m: OnboardingState): OnboardingStep {
+  let s = step;
+  while (AUTO_PASS.has(s) && stepComplete(s, m).ok) s = nextStep(s) ?? s;
+  return s;
 }
 
 /**
@@ -76,12 +92,12 @@ export function canAdvance(m: OnboardingState, from: OnboardingStep, opts: { ski
     return SKIPPABLE.has(from) ? { ok: true, to } : { ok: false, message: "This step can't be skipped." };
   }
   const done = stepComplete(from, m);
-  return done.ok ? { ok: true, to } : done;
+  return done.ok ? { ok: true, to: passCompleted(to, m) } : done;
 }
 
-/** Live needs a business, a confirmed email and accepted terms; the rest has defaults. */
+/** Live needs a business, a confirmed email, a passkey and accepted terms; the rest has defaults. */
 export function canGoLive(m: OnboardingState): { ok: true } | { ok: false; message: string } {
-  for (const step of ["business", "email", "terms"] as const) {
+  for (const step of ["business", "email", "secure", "terms"] as const) {
     const r = stepComplete(step, m);
     if (!r.ok) return r;
   }

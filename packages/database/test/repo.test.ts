@@ -21,7 +21,7 @@ import {
 let db: Db;
 before(async () => {
   db = await connectMemory();
-  assert.deepEqual(await migrate(db), ["001_merchants_and_auth.sql", "002_rate_limits_and_secret_keys.sql", "003_onboarding.sql"]);
+  assert.deepEqual(await migrate(db), ["001_merchants_and_auth.sql", "002_rate_limits_and_secret_keys.sql", "003_onboarding.sql", "004_email_and_google_sign_in.sql"]);
   assert.deepEqual(await migrate(db), [], "migrations are idempotent");
 });
 after(() => db.close());

@@ -59,6 +59,7 @@ const stepState = (m: Merchant) => ({
   country: m.country,
   contact_email_verified: Boolean(m.contact_email_verified_at),
   terms_accepted: Boolean(m.terms_accepted_at),
+  has_passkey: Boolean(m.intents_account_id),
   onboarding_step: m.onboarding_step,
   live: Boolean(m.live_at),
 });
@@ -216,6 +217,7 @@ export function registerOnboarding(app: Hono<Env>, d: OnboardingDeps) {
 
   app.post("/v1/me/passkeys/verify", requireMerchant, async c => {
     const merchant = c.get("merchant");
+    if (!hasAccount(merchant)) return noPasskey(c);
     const limited = await limit(c, "addDevice", merchant.id);
     if (limited) return limited;
     const b = await body<{ challengeId?: string; response?: RegistrationResponseJSON; deviceLabel?: string }>(c);
@@ -267,6 +269,7 @@ export function registerOnboarding(app: Hono<Env>, d: OnboardingDeps) {
 
   app.post("/v1/relayer/key-intents", requireMerchant, async c => {
     const merchant = c.get("merchant");
+    if (!hasAccount(merchant)) return noPasskey(c);
     if (!d.relayer) return c.json({ error: "relayer_unavailable", message: "Adding a device isn't available right now. You can skip this and add one later." }, 503);
     const limited = await limit(c, "relayer", merchant.id);
     if (limited) return limited;
@@ -314,6 +317,7 @@ export function registerOnboarding(app: Hono<Env>, d: OnboardingDeps) {
       const unavailable = oneclickOrFail(c);
       if (unavailable) return unavailable;
       const merchant = c.get("merchant");
+    if (!hasAccount(merchant)) return noPasskey(c);
       const limited = await limit(c, "testPayment", merchant.id);
       if (limited) return limited;
       const b = await body<{ refund_address?: string }>(c);
@@ -369,6 +373,7 @@ export function registerOnboarding(app: Hono<Env>, d: OnboardingDeps) {
       const unavailable = oneclickOrFail(c);
       if (unavailable) return unavailable;
       const merchant = c.get("merchant");
+    if (!hasAccount(merchant)) return noPasskey(c);
       const limited = await limit(c, "testPayment", merchant.id);
       if (limited) return limited;
       const t = await latestTestPayment(db, merchant.id);
@@ -406,6 +411,7 @@ export function registerOnboarding(app: Hono<Env>, d: OnboardingDeps) {
       const unavailable = oneclickOrFail(c);
       if (unavailable) return unavailable;
       const merchant = c.get("merchant");
+    if (!hasAccount(merchant)) return noPasskey(c);
       const t = await latestTestPayment(db, merchant.id);
       const b = await body<{ signed?: Record<string, unknown> }>(c);
       const s = b.signed;
@@ -429,4 +435,13 @@ export function registerOnboarding(app: Hono<Env>, d: OnboardingDeps) {
       return oneclickDown(c, error);
     }
   });
+}
+
+/** A merchant whose passkey account exists. Email and Google sign-ups have none until "secure". */
+function hasAccount(m: Merchant): m is Merchant & { intents_account_id: string } {
+  return m.intents_account_id !== null;
+}
+
+function noPasskey(c: Context) {
+  return c.json({ error: "no_passkey", message: "Create your passkey first: it holds your balance." }, 409);
 }

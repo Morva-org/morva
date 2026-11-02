@@ -59,5 +59,10 @@ export async function setup(extra: Partial<Deps> = {}) {
     return { c, auth, merchant: res.body.merchant as Record<string, any> };
   };
 
-  return { db, app, sent, client, merchant, close: () => db.close() };
+  return { db, app, sent, client, merchant, close: once(() => db.close()) };
+}
+
+function once(fn: () => Promise<void>) {
+  let done: Promise<void> | undefined;
+  return () => (done ??= fn());
 }

@@ -13,8 +13,18 @@ import {
 } from "@simplewebauthn/server";
 import { cose, decodeCredentialPublicKey } from "@simplewebauthn/server/helpers";
 import {
+  attachFirstPasskey,
   consumeChallenge,
+  consumeOAuthState,
   createChallenge,
+  createLoginCode,
+  createMerchantFromEmail,
+  createOAuthState,
+  findMerchantByGoogleSub,
+  findMerchantByVerifiedEmail,
+  latestLoginCode,
+  linkGoogle,
+  recordLoginCodeAttempt,
   createEmailCode,
   createMerchantWithPasskey,
   createSession,
@@ -175,7 +185,7 @@ export function createApp({ db, config, mailer, limiter = new RateLimiter(db), r
     const raw = rawP256FromCoordinates(x, y);
 
     if (await findPasskeyByCredentialId(db, credential.id)) return c.json({ error: "passkey_exists" }, 409);
-    const { merchant } = await createMerchantWithPasskey(db, p256AccountId(raw), {
+    const newPasskey = {
       credentialId: credential.id,
       publicKey: credential.publicKey,
       publicKeyP256: p256PublicKeyString(raw),
@@ -183,7 +193,19 @@ export function createApp({ db, config, mailer, limiter = new RateLimiter(db), r
       transports: credential.transports ?? [],
       backedUp: credentialBackedUp,
       deviceLabel: body.deviceLabel?.slice(0, 60) ?? null,
-    });
+    };
+
+    // Signed in with email or Google: this first passkey protects their balance.
+    const hash = sessionHash(c);
+    const current = hash ? await getSessionMerchant(db, hash) : null;
+    if (current) {
+      if (current.intents_account_id) return c.json({ error: "has_passkey", message: "You already have a passkey. Add another device in Settings." }, 409);
+      const merchant = await attachFirstPasskey(db, current.id, p256AccountId(raw), newPasskey);
+      return c.json({ merchant: publicMerchant(merchant) }, 201);
+    }
+
+    // Signing up with a passkey: the passkey creates the account.
+    const { merchant } = await createMerchantWithPasskey(db, p256AccountId(raw), newPasskey);
     await startSession(c, merchant.id);
     return c.json({ merchant: publicMerchant(merchant) }, 201);
   });
@@ -237,6 +259,100 @@ export function createApp({ db, config, mailer, limiter = new RateLimiter(db), r
     return c.json({ ok: true });
   });
 
+  // --- sign up or log in with an email code ----------------------------------------------
+  // One flow for both: the code proves the email, then we find or create its merchant.
+
+  app.post("/v1/auth/email/start", async c => {
+    const b = await c.req.json<{ email?: string }>().catch(() => ({}) as { email?: string });
+    const email = b.email?.trim().toLowerCase() ?? "";
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) return c.json({ error: "invalid_email", message: "Check your email address." }, 400);
+    const limited = (await limit(c, "emailSend", `ip:${c.get("ip")}`)) ?? (await limit(c, "emailSend", `email:${email}`));
+    if (limited) return limited;
+    const code = String(randomInt(0, 1_000_000)).padStart(6, "0");
+    await createLoginCode(db, email, loginCodeHash(config, email, code), new Date(Date.now() + EMAIL_CODE_TTL_MS));
+    await mailer.sendVerificationCode(email, code);
+    return c.json({ sent: true });
+  });
+
+  app.post("/v1/auth/email/verify", async c => {
+    const b = await c.req.json<{ email?: string; code?: string }>().catch(() => ({}) as { email?: string; code?: string });
+    const email = b.email?.trim().toLowerCase() ?? "";
+    const limited = await limit(c, "emailVerify", `email:${email}`);
+    if (limited) return limited;
+    const pending = email ? await latestLoginCode(db, email) : null;
+    if (!pending || pending.expires_at.getTime() < Date.now() || pending.attempts >= EMAIL_CODE_ATTEMPTS) {
+      return c.json({ error: "code_expired", message: "That code has expired. Send a new one." }, 400);
+    }
+    const ok = typeof b.code === "string" && /^\d{6}$/.test(b.code) && timingSafeEqual(Buffer.from(pending.code_hash), loginCodeHash(config, email, b.code));
+    await recordLoginCodeAttempt(db, pending.id, ok);
+    if (!ok) return c.json({ error: "code_wrong", message: "That code isn’t right. Check the email and try again.", attempts_left: EMAIL_CODE_ATTEMPTS - pending.attempts - 1 }, 400);
+    const existing = await findMerchantByVerifiedEmail(db, email);
+    const merchant = existing ?? (await createMerchantFromEmail(db, email));
+    await recordAudit(db, merchant.id, "login", { via: "email" });
+    await startSession(c, merchant.id);
+    return c.json({ merchant: publicMerchant(merchant), created: !existing }, existing ? 200 : 201);
+  });
+
+  // --- sign up or log in with Google (OpenID Connect, authorization code + PKCE) ---------
+
+  const google = config.google;
+  const googleRedirect = `${config.webOrigin}/api/v1/auth/google/callback`;
+
+  app.get("/v1/auth/methods", c => c.json({ email: true, google: Boolean(google), passkey: true }));
+
+  app.get("/v1/auth/google/start", async c => {
+    if (!google) return c.json({ error: "unavailable" }, 404);
+    const limited = await limit(c, "login", c.get("ip"));
+    if (limited) return limited;
+    const state = b64url(randomBytes(24));
+    const verifier = b64url(randomBytes(32));
+    await createOAuthState(db, state, verifier, new Date(Date.now() + 10 * 60_000));
+    const url = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+    url.search = new URLSearchParams({
+      client_id: google.clientId,
+      redirect_uri: googleRedirect,
+      response_type: "code",
+      scope: "openid email",
+      state,
+      code_challenge: b64url(sha256(verifier)),
+      code_challenge_method: "S256",
+      prompt: "select_account",
+    }).toString();
+    return c.redirect(url.toString(), 302);
+  });
+
+  app.get("/v1/auth/google/callback", async c => {
+    const fail = (reason: string) => c.redirect(`${config.webOrigin}/start?error=${reason}`, 302);
+    if (!google) return fail("google_unavailable");
+    const { code, state } = c.req.query();
+    const verifier = state ? await consumeOAuthState(db, state) : null;
+    if (!code || !verifier) return fail("google_expired");
+    const tokenRes = await (google.fetch ?? fetch)("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ code, client_id: google.clientId, client_secret: google.clientSecret, redirect_uri: googleRedirect, grant_type: "authorization_code", code_verifier: verifier }),
+      signal: AbortSignal.timeout(10_000),
+    }).catch(() => null);
+    if (!tokenRes?.ok) return fail("google_failed");
+    const { id_token } = (await tokenRes.json()) as { id_token?: string };
+    const claims = id_token ? readGoogleIdToken(id_token, google.clientId) : null;
+    if (!claims) return fail("google_failed");
+
+    let merchant = await findMerchantByGoogleSub(db, claims.sub);
+    if (!merchant) {
+      const byEmail = await findMerchantByVerifiedEmail(db, claims.email);
+      if (byEmail) {
+        await linkGoogle(db, byEmail.id, claims.sub);
+        merchant = byEmail;
+      } else {
+        merchant = await createMerchantFromEmail(db, claims.email, claims.sub);
+      }
+    }
+    await recordAudit(db, merchant.id, "login", { via: "google" });
+    await startSession(c, merchant.id);
+    return c.redirect(`${config.webOrigin}/start`, 302);
+  });
+
   // --- the signed-in merchant ----------------------------------------------------------
 
   app.get("/v1/me", requireMerchant, async c => {
@@ -288,6 +404,8 @@ export function createApp({ db, config, mailer, limiter = new RateLimiter(db), r
     const ok = typeof code === "string" && /^\d{6}$/.test(code) && timingSafeEqual(Buffer.from(pending.code_hash), emailCodeHash(config, merchant.id, code));
     await recordEmailCodeAttempt(db, pending.id, ok);
     if (!ok) return c.json({ error: "code_wrong", attempts_left: EMAIL_CODE_ATTEMPTS - pending.attempts - 1 }, 400);
+    const owner = await findMerchantByVerifiedEmail(db, pending.email);
+    if (owner && owner.id !== merchant.id) return c.json({ error: "email_taken", message: "Another Morva account uses this email. Log in with it instead." }, 409);
     await setContactEmail(db, merchant.id, pending.email);
     return c.json({ verified: true, email: pending.email });
   });
@@ -295,6 +413,28 @@ export function createApp({ db, config, mailer, limiter = new RateLimiter(db), r
   registerOnboarding(app, { db, config, limit, requireMerchant, publicMerchant, relayer, oneclick, verifierRpcUrl });
 
   return app;
+}
+
+function loginCodeHash(config: Config, email: string, code: string): Buffer {
+  return createHmac("sha256", config.sessionSecret).update(`login:${email}:${code}`).digest();
+}
+
+/**
+ * Reads a Google ID token received straight from Google's token endpoint over TLS (with our client
+ * secret), so OpenID Connect allows trusting it without re-checking the signature. The claims are
+ * still checked: issuer, audience, expiry and a verified email.
+ */
+export function readGoogleIdToken(token: string, clientId: string, now = Date.now()): { sub: string; email: string } | null {
+  try {
+    const claims = JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8")) as Record<string, unknown>;
+    if (claims.iss !== "https://accounts.google.com" && claims.iss !== "accounts.google.com") return null;
+    if (claims.aud !== clientId) return null;
+    if (typeof claims.exp !== "number" || claims.exp * 1000 < now) return null;
+    if (claims.email_verified !== true || typeof claims.email !== "string" || typeof claims.sub !== "string") return null;
+    return { sub: claims.sub, email: claims.email.toLowerCase() };
+  } catch {
+    return null;
+  }
 }
 
 function emailCodeHash(config: Config, merchantId: string, code: string): Buffer {
@@ -312,6 +452,8 @@ export function publicMerchant(m: Merchant) {
     contact_email: m.contact_email,
     contact_email_verified: Boolean(m.contact_email_verified_at),
     intents_account_id: m.intents_account_id,
+    has_passkey: Boolean(m.intents_account_id),
+    google_linked: Boolean(m.google_sub),
     settlement_asset: m.settlement_asset,
     payout_mode: m.payout_mode,
     payout_chain: m.payout_chain,

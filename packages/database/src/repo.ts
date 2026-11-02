@@ -10,7 +10,9 @@ export interface Merchant {
   country: string | null;
   contact_email: string | null;
   contact_email_verified_at: Date | null;
-  intents_account_id: string;
+  /** Set when the merchant creates their first passkey; empty before that. */
+  intents_account_id: string | null;
+  google_sub: string | null;
   settlement_asset: string;
   payout_mode: "keep_in_balance" | "auto_payout";
   payout_chain: string | null;
@@ -348,4 +350,84 @@ export async function updateTestPayment(
   const sets = [...entries.map(([k], i) => `${k} = $${i + 2}`), "updated_at = now()"].join(", ");
   const [row] = await db.query<TestPayment>(`UPDATE test_payment SET ${sets} WHERE id = $1 RETURNING *`, [id, ...entries.map(([, v]) => v)]);
   return row!;
+}
+
+// --- email and Google sign-in -----------------------------------------------------------
+
+export async function findMerchantByVerifiedEmail(db: Db, email: string): Promise<Merchant | null> {
+  return (
+    (await db.query<Merchant>("SELECT * FROM merchant WHERE lower(contact_email) = lower($1) AND contact_email_verified_at IS NOT NULL", [email]))[0] ?? null
+  );
+}
+
+export async function findMerchantByGoogleSub(db: Db, sub: string): Promise<Merchant | null> {
+  return (await db.query<Merchant>("SELECT * FROM merchant WHERE google_sub = $1", [sub]))[0] ?? null;
+}
+
+/** A merchant who signed up with a verified email (from a code or from Google). No passkey yet. */
+export async function createMerchantFromEmail(db: Db, email: string, googleSub: string | null = null): Promise<Merchant> {
+  const [m] = await db.query<Merchant>(
+    "INSERT INTO merchant (contact_email, contact_email_verified_at, google_sub) VALUES ($1, now(), $2) RETURNING *",
+    [email, googleSub],
+  );
+  await recordAudit(db, m!.id, "merchant.created", { via: googleSub ? "google" : "email" });
+  return m!;
+}
+
+export async function linkGoogle(db: Db, merchantId: string, sub: string): Promise<void> {
+  await db.query("UPDATE merchant SET google_sub = $2 WHERE id = $1 AND google_sub IS NULL", [merchantId, sub]);
+  await recordAudit(db, merchantId, "google.linked", {});
+}
+
+/**
+ * The merchant's first passkey: it defines their NEAR Intents account. Fails if they already
+ * have one (further devices go through add_public_key).
+ */
+export async function attachFirstPasskey(db: Db, merchantId: string, intentsAccountId: string, passkey: NewPasskey): Promise<Merchant> {
+  return db.transaction(async tx => {
+    const [m] = await tx.query<Merchant>(
+      "UPDATE merchant SET intents_account_id = $2 WHERE id = $1 AND intents_account_id IS NULL RETURNING *",
+      [merchantId, intentsAccountId],
+    );
+    if (!m) throw new Error("Merchant already has a passkey account");
+    await tx.query(
+      `INSERT INTO passkey (merchant_id, credential_id, public_key, public_key_p256, sign_count, transports, backed_up, device_label, registered_on_verifier_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())`,
+      [merchantId, passkey.credentialId, passkey.publicKey, passkey.publicKeyP256, passkey.signCount, passkey.transports, passkey.backedUp, passkey.deviceLabel ?? null],
+    );
+    await recordAudit(tx, merchantId, "passkey.added", { credential_id: passkey.credentialId, first: true });
+    return m;
+  });
+}
+
+export async function createLoginCode(db: Db, email: string, codeHash: Uint8Array, expiresAt: Date): Promise<void> {
+  await db.query("UPDATE login_code SET consumed_at = now() WHERE lower(email) = lower($1) AND consumed_at IS NULL", [email]);
+  await db.query("INSERT INTO login_code (email, code_hash, expires_at) VALUES ($1, $2, $3)", [email, codeHash, expiresAt]);
+}
+
+export async function latestLoginCode(db: Db, email: string) {
+  return (
+    (
+      await db.query<{ id: string; code_hash: Uint8Array; attempts: number; expires_at: Date }>(
+        "SELECT id, code_hash, attempts, expires_at FROM login_code WHERE lower(email) = lower($1) AND consumed_at IS NULL ORDER BY created_at DESC LIMIT 1",
+        [email],
+      )
+    )[0] ?? null
+  );
+}
+
+export async function recordLoginCodeAttempt(db: Db, id: string, consumed: boolean): Promise<void> {
+  await db.query("UPDATE login_code SET attempts = attempts + 1, consumed_at = CASE WHEN $2 THEN now() ELSE consumed_at END WHERE id = $1", [id, consumed]);
+}
+
+export async function createOAuthState(db: Db, state: string, codeVerifier: string, expiresAt: Date): Promise<void> {
+  await db.query("INSERT INTO oauth_state (state, code_verifier, expires_at) VALUES ($1, $2, $3)", [state, codeVerifier, expiresAt]);
+}
+
+export async function consumeOAuthState(db: Db, state: string): Promise<string | null> {
+  const rows = await db.query<{ code_verifier: string }>(
+    "UPDATE oauth_state SET used_at = now() WHERE state = $1 AND used_at IS NULL AND expires_at > now() RETURNING code_verifier",
+    [state],
+  );
+  return rows[0]?.code_verifier ?? null;
 }

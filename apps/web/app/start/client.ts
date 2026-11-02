@@ -11,7 +11,9 @@ export interface Merchant {
   country: string | null;
   contact_email: string | null;
   contact_email_verified: boolean;
-  intents_account_id: string;
+  intents_account_id: string | null;
+  has_passkey: boolean;
+  google_linked: boolean;
   payout_mode: "keep_in_balance" | "auto_payout";
   payout_chain: string | null;
   payout_address: string | null;
@@ -50,6 +52,24 @@ export async function api<T = Record<string, unknown>>(method: string, path: str
   return json as T;
 }
 
+// --- email and Google sign-in --------------------------------------------------------------
+
+export const sendLoginCode = (email: string) => api("POST", "/auth/email/start", { email });
+
+export async function verifyLoginCode(email: string, code: string): Promise<Merchant> {
+  return (await api<{ merchant: Merchant }>("POST", "/auth/email/verify", { email, code })).merchant;
+}
+
+export const GOOGLE_START = "/api/v1/auth/google/start";
+
+/** Plain words for the `?error=` the Google callback sends back to /start. */
+export function googleError(code: string | null): string | null {
+  if (!code) return null;
+  if (code === "google_expired") return "Google sign-in took too long. Try again.";
+  if (code === "google_unavailable") return "Google sign-in isn’t available right now. Use your email instead.";
+  return "Google couldn’t sign you in. Try again, or use your email.";
+}
+
 // --- passkeys -------------------------------------------------------------------------------
 
 /** Plain words for the browser's passkey errors. */
@@ -61,7 +81,11 @@ export function passkeyMessage(error: unknown): string {
   return "Your device couldn't create a passkey. Try again, or use another device.";
 }
 
-export async function signUpWithPasskey(): Promise<Merchant> {
+/**
+ * Creates a passkey. Signed in (email or Google), it becomes the passkey that holds this
+ * merchant's balance; signed out, it creates a new merchant.
+ */
+export async function createPasskey(): Promise<Merchant> {
   const { challengeId, options } = await api<{ challengeId: string; options: Parameters<typeof startRegistration>[0]["optionsJSON"] }>("POST", "/auth/register/options");
   const response = await startRegistration({ optionsJSON: options });
   return (await api<{ merchant: Merchant }>("POST", "/auth/register/verify", { challengeId, response, deviceLabel: deviceLabel() })).merchant;

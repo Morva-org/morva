@@ -1,18 +1,47 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft, Check, Copy, Download, RotateCcw } from "lucide-react";
-import { normalizeHandle, PAYOUT_CHAINS, previousStep, resumeStep, validateHandle, validatePayoutAddress, type OnboardingStep } from "@morva/domain";
+import { ArrowLeft, Check, Copy, Download, Fingerprint, RotateCcw } from "lucide-react";
+import { normalizeHandle, ONBOARDING_STEPS, PAYOUT_CHAINS, previousStep, resumeStep, validateHandle, validatePayoutAddress, type OnboardingStep } from "@morva/domain";
 import { MorvaMark } from "../MorvaMark";
-import { addBackupDevice, api, ApiError, download, logInWithPasskey, passkeyMessage, qrPng, qrSvg, signUpWithPasskey, signWithPasskey, type Merchant } from "./client";
+import {
+  addBackupDevice,
+  api,
+  ApiError,
+  createPasskey,
+  download,
+  GOOGLE_START,
+  googleError,
+  logInWithPasskey,
+  passkeyMessage,
+  qrPng,
+  qrSvg,
+  sendLoginCode,
+  signWithPasskey,
+  verifyLoginCode,
+  type Merchant,
+} from "./client";
 import { countries } from "./countries";
 
-// Merchant onboarding: one question per screen, saved as you go, resumable from any device.
+// Merchant onboarding: sign up with email, Google or a passkey, then one question per screen,
+// saved as you go and resumable from any device.
 
-type Screen = "loading" | "welcome" | "creating" | OnboardingStep;
-const ORDER: Screen[] = ["welcome", "creating", "business", "email", "payout", "channels", "defaults", "backup", "terms", "test_payment", "live"];
+type Screen = "loading" | "auth" | OnboardingStep;
 const PAY_BASE = process.env.NEXT_PUBLIC_PAY_BASE_URL ?? "https://pay.morva.xyz";
 const rpId = () => process.env.NEXT_PUBLIC_RP_ID ?? window.location.hostname;
+
+const LABELS: Record<OnboardingStep, string> = {
+  business: "Your business",
+  email: "Your email",
+  payout: "How you get paid",
+  channels: "How you sell",
+  defaults: "Order defaults",
+  secure: "Protect your balance",
+  backup: "Backup device",
+  terms: "Terms",
+  test_payment: "Test payment",
+  live: "Go live",
+};
 
 const stateOf = (m: Merchant) => ({
   handle: m.handle,
@@ -20,9 +49,21 @@ const stateOf = (m: Merchant) => ({
   country: m.country,
   contact_email_verified: m.contact_email_verified,
   terms_accepted: m.terms_accepted,
+  has_passkey: m.has_passkey,
   onboarding_step: m.onboarding_step,
   live: m.live,
 });
+
+/** The steps shown in the rail: email only for merchants who still need to confirm one. */
+const visibleSteps = (m: Merchant, screen: Screen) => ONBOARDING_STEPS.filter(s => s !== "email" || !m.contact_email_verified || screen === "email");
+
+/** Going back skips steps that were done for the merchant (a confirmed email, a passkey). */
+function backFrom(screen: OnboardingStep, m: Merchant): OnboardingStep | null {
+  if (screen === "live") return null;
+  let s = previousStep(screen);
+  while (s && ((s === "email" && m.contact_email_verified) || s === "secure")) s = previousStep(s);
+  return s;
+}
 
 interface StepProps {
   m: Merchant;
@@ -34,18 +75,21 @@ export function Onboarding() {
   const [screen, setScreen] = useState<Screen>("loading");
   const [m, setM] = useState<Merchant | null>(null);
 
+  const enter = useCallback((merchant: Merchant) => {
+    setM(merchant);
+    setScreen(resumeStep(stateOf(merchant)));
+    window.scrollTo({ top: 0 });
+  }, []);
+
   useEffect(() => {
     api<{ merchant: Merchant }>("GET", "/me")
-      .then(r => {
-        setM(r.merchant);
-        setScreen(resumeStep(stateOf(r.merchant)));
-      })
-      .catch(() => setScreen("welcome"));
-  }, []);
+      .then(r => enter(r.merchant))
+      .catch(() => setScreen("auth"));
+  }, [enter]);
 
   const next = useCallback(
     async (skip = false) => {
-      if (!m || !(ORDER as string[]).includes(screen) || screen === "welcome" || screen === "creating" || screen === "loading") return;
+      if (!m || screen === "loading" || screen === "auth") return;
       const r = await api<{ step: OnboardingStep; merchant: Merchant }>("POST", "/onboarding/step", { from: screen, skip });
       setM(r.merchant);
       setScreen(r.step);
@@ -54,54 +98,92 @@ export function Onboarding() {
     [m, screen],
   );
 
-  const back = screen !== "loading" && screen !== "welcome" && screen !== "creating" && screen !== "live" ? previousStep(screen) : null;
-  const position = Math.max(0, ORDER.indexOf(screen));
+  const signOut = async () => {
+    await api("POST", "/auth/logout").catch(() => {});
+    setM(null);
+    setScreen("auth");
+  };
+
+  if (screen === "loading") return <div className="ob" aria-busy="true" />;
+  if (screen === "auth" || !m) return <Auth onSignedIn={enter} />;
+
+  const steps = visibleSteps(m, screen);
+  const at = steps.indexOf(screen);
+  const furthest = Math.max(at, steps.indexOf(resumeStep(stateOf(m))));
+  const back = backFrom(screen, m);
+  const revisitable = (s: OnboardingStep) => !["secure", "backup", "test_payment", "live"].includes(s);
 
   return (
-    <div className="ob">
-      <header className="ob-top">
-        <div className="ob-bar">
-          {back ? (
-            <button type="button" className="ob-back" onClick={() => setScreen(back)}>
-              <ArrowLeft size={18} strokeWidth={1.5} /> Back
-            </button>
-          ) : (
-            <span />
-          )}
-          <span className="ob-brand">
-            <MorvaMark size={22} /> morva
-          </span>
-          <span className="ob-count num" aria-label={`Step ${position + 1} of ${ORDER.length}`}>
-            {screen === "loading" ? "" : `${position + 1} / ${ORDER.length}`}
-          </span>
+    <div className="ob ob-shell">
+      <aside className="ob-rail">
+        <span className="ob-brand">
+          <MorvaMark size={22} /> morva
+        </span>
+        <ol className="ob-rail-steps">
+          {steps.map((s, i) => {
+            const state = i === at ? "is-current" : i < furthest ? "is-done" : "";
+            const canGo = state === "is-done" && revisitable(s) && !m.live;
+            return (
+              <li key={s} className={state}>
+                <span className="ob-rail-dot" aria-hidden="true">
+                  {state === "is-done" && <Check size={12} strokeWidth={2} />}
+                </span>
+                {canGo ? (
+                  <button type="button" onClick={() => setScreen(s)}>
+                    {LABELS[s]}
+                  </button>
+                ) : (
+                  <span aria-current={i === at ? "step" : undefined}>{LABELS[s]}</span>
+                )}
+              </li>
+            );
+          })}
+        </ol>
+        <div className="ob-rail-foot">
+          {m.contact_email && <span className="ob-rail-email">{m.contact_email}</span>}
+          <button type="button" className="ob-link ob-link-quiet" onClick={() => void signOut()}>
+            Sign out
+          </button>
         </div>
-        <div className="ob-progress" aria-hidden="true">
-          <span style={{ transform: `scaleX(${(position + 1) / ORDER.length})` }} />
-        </div>
-      </header>
+      </aside>
 
-      <main className="ob-main">
-        {screen === "loading" && <p className="ob-muted">Loading…</p>}
-        {screen === "welcome" && (
-          <Welcome
-            onCreate={() => setScreen("creating")}
-            onLogin={merchant => {
-              setM(merchant);
-              setScreen(resumeStep(stateOf(merchant)));
-            }}
-          />
-        )}
-        {screen === "creating" && <Creating onDone={merchant => setM(merchant)} merchant={m} onBack={() => setScreen("welcome")} onContinue={() => setScreen("business")} />}
-        {m && screen === "business" && <Business m={m} setM={setM} next={next} />}
-        {m && screen === "email" && <Email m={m} setM={setM} next={next} />}
-        {m && screen === "payout" && <Payout m={m} setM={setM} next={next} />}
-        {m && screen === "channels" && <Channels m={m} setM={setM} next={next} />}
-        {m && screen === "defaults" && <Defaults m={m} setM={setM} next={next} />}
-        {m && screen === "backup" && <Backup m={m} setM={setM} next={next} />}
-        {m && screen === "terms" && <Terms m={m} setM={setM} next={next} />}
-        {m && screen === "test_payment" && <TestPayment m={m} setM={setM} next={next} />}
-        {m && screen === "live" && <Live m={m} setM={setM} next={next} />}
-      </main>
+      <div className="ob-pane">
+        <header className="ob-top">
+          <div className="ob-bar">
+            {back ? (
+              <button type="button" className="ob-back" onClick={() => setScreen(back)}>
+                <ArrowLeft size={18} strokeWidth={1.5} /> Back
+              </button>
+            ) : (
+              <span />
+            )}
+            <span className="ob-brand ob-brand-top">
+              <MorvaMark size={22} /> morva
+            </span>
+            <span className="ob-count num">
+              Step {at + 1} of {steps.length}
+            </span>
+          </div>
+          <div className="ob-segments" aria-hidden="true">
+            {steps.map((s, i) => (
+              <span key={s} className={i <= at ? "is-on" : ""} />
+            ))}
+          </div>
+        </header>
+
+        <main className="ob-main" key={screen}>
+          {screen === "business" && <Business m={m} setM={setM} next={next} />}
+          {screen === "email" && <Email m={m} setM={setM} next={next} />}
+          {screen === "payout" && <Payout m={m} setM={setM} next={next} />}
+          {screen === "channels" && <Channels m={m} setM={setM} next={next} />}
+          {screen === "defaults" && <Defaults m={m} setM={setM} next={next} />}
+          {screen === "secure" && <Secure m={m} setM={setM} next={next} />}
+          {screen === "backup" && <Backup m={m} setM={setM} next={next} />}
+          {screen === "terms" && <Terms m={m} setM={setM} next={next} />}
+          {screen === "test_payment" && <TestPayment m={m} setM={setM} next={next} />}
+          {screen === "live" && <Live m={m} setM={setM} next={next} />}
+        </main>
+      </div>
     </div>
   );
 }
@@ -174,115 +256,300 @@ function useAutosave(path: string, setM: (m: Merchant) => void, delay = 500) {
   return { save, later, ...state };
 }
 
-// --- 1. welcome -------------------------------------------------------------------------------
-
-function Welcome({ onCreate, onLogin }: { onCreate: () => void; onLogin: (m: Merchant) => void }) {
-  const [explain, setExplain] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+/** Six boxes over one real input, so paste, autofill and one-time-code suggestions all work. */
+function CodeInput({ value, onChange, disabled, invalid }: { value: string; onChange: (v: string) => void; disabled?: boolean; invalid?: boolean }) {
+  const [focused, setFocused] = useState(false);
   return (
-    <>
-      <Title lead="Set-up takes about three minutes. No card, no bank account, no seed phrase.">Get paid by anyone holding crypto.</Title>
-      <div className="ob-actions">
-        <button type="button" className="btn btn-accent btn-block" onClick={onCreate}>
-          Continue with a passkey
-        </button>
-        <button type="button" className="ob-link" aria-expanded={explain} onClick={() => setExplain(v => !v)}>
-          What’s a passkey?
-        </button>
-        {explain && (
-          <p className="ob-popover" role="note">
-            A passkey replaces passwords: you sign in with Face ID, your fingerprint or your device PIN, and the key never leaves your device.
-          </p>
-        )}
-      </div>
-      <p className="ob-muted ob-foot">
-        Already set up?{" "}
-        <button
-          type="button"
-          className="ob-link"
-          onClick={async () => {
-            setError(null);
-            try {
-              onLogin(await logInWithPasskey());
-            } catch (e) {
-              setError(passkeyMessage(e));
-            }
-          }}
-        >
-          Log in with your passkey
-        </button>
-      </p>
-      {error && <p className="ob-error">{error}</p>}
-    </>
+    <div className={`ob-otp${invalid ? " is-invalid" : ""}`}>
+      <input
+        aria-label="6-digit code"
+        inputMode="numeric"
+        autoComplete="one-time-code"
+        autoFocus
+        maxLength={6}
+        value={value}
+        disabled={disabled}
+        onFocus={() => setFocused(true)}
+        onBlur={() => setFocused(false)}
+        onChange={e => onChange(e.target.value.replace(/\D/g, "").slice(0, 6))}
+      />
+      {Array.from({ length: 6 }, (_, i) => (
+        <span key={i} className={`ob-otp-box num${focused && i === Math.min(value.length, 5) ? " is-active" : ""}`} aria-hidden="true">
+          {value[i] ?? ""}
+        </span>
+      ))}
+    </div>
   );
 }
 
-// --- 2. create passkey ------------------------------------------------------------------------
+// --- sign up or log in --------------------------------------------------------------------------
 
-function Creating({ merchant, onDone, onBack, onContinue }: { merchant: Merchant | null; onDone: (m: Merchant) => void; onBack: () => void; onContinue: () => void }) {
-  const [phase, setPhase] = useState<"prompt" | "account" | "done" | "error">(merchant ? "done" : "prompt");
+function GoogleG() {
+  // Google's sign-in guidelines require the full-colour G on this button.
+  return (
+    <svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true">
+      <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z" />
+      <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z" />
+      <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z" />
+      <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z" />
+    </svg>
+  );
+}
+
+const RESEND_AFTER_S = 30;
+
+function Auth({ onSignedIn }: { onSignedIn: (m: Merchant) => void }) {
+  const [google, setGoogle] = useState(false);
+  const [stage, setStage] = useState<"start" | "code">("start");
+  const [email, setEmail] = useState("");
+  const [code, setCode] = useState("");
+  const [busy, setBusy] = useState<"email" | "code" | "passkey" | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const started = useRef(false);
+  const [wait, setWait] = useState(0);
 
-  const run = useCallback(async () => {
+  useEffect(() => {
+    void api<{ google: boolean }>("GET", "/auth/methods")
+      .then(r => setGoogle(r.google))
+      .catch(() => {});
+    const params = new URLSearchParams(window.location.search);
+    const fromGoogle = googleError(params.get("error"));
+    if (fromGoogle) {
+      setError(fromGoogle);
+      window.history.replaceState(null, "", "/start");
+    }
+  }, []);
+
+  useEffect(() => {
+    if (wait <= 0) return;
+    const id = window.setTimeout(() => setWait(w => w - 1), 1000);
+    return () => window.clearTimeout(id);
+  }, [wait]);
+
+  const send = async () => {
+    setBusy("email");
+    setError(null);
+    try {
+      await sendLoginCode(email.trim());
+      setStage("code");
+      setCode("");
+      setWait(RESEND_AFTER_S);
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "Couldn’t send the code. Check your connection.");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const verify = async (value: string) => {
+    setBusy("code");
+    setError(null);
+    try {
+      onSignedIn(await verifyLoginCode(email.trim(), value));
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "Couldn’t check the code.");
+      setCode("");
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div className="ob ob-auth">
+      <aside className="ob-auth-panel">
+        <span className="ob-brand">
+          <MorvaMark size={24} /> morva
+        </span>
+        <div className="ob-auth-pitch">
+          <h2>Take crypto payments from any chain. Keep USDC.</h2>
+          <ul>
+            <li>
+              <Check size={16} strokeWidth={1.5} /> Customers pay with what they hold, on the chain they use.
+            </li>
+            <li>
+              <Check size={16} strokeWidth={1.5} /> You receive the exact amount you asked for.
+            </li>
+            <li>
+              <Check size={16} strokeWidth={1.5} /> Only your passkey can move your balance. Not Morva.
+            </li>
+          </ul>
+        </div>
+        <p className="ob-auth-small">Set-up takes about three minutes. No card, no bank account, no seed phrase.</p>
+      </aside>
+
+      <main className="ob-auth-main">
+        <a href="/" className="ob-brand ob-auth-logo">
+          <MorvaMark size={22} /> morva
+        </a>
+        {stage === "start" ? (
+          <div className="ob-auth-card">
+            <Title lead="Create an account or log in. We’ll find your account by email.">Get started</Title>
+            <div className="ob-auth-methods">
+              {google && (
+                <>
+                  <a className="btn btn-outline btn-block ob-google" href={GOOGLE_START}>
+                    <GoogleG /> Continue with Google
+                  </a>
+                  <div className="ob-divider">or</div>
+                </>
+              )}
+              <form
+                className="ob-fields"
+                onSubmit={e => {
+                  e.preventDefault();
+                  void send();
+                }}
+              >
+                <label className="field">
+                  Work email
+                  <input type="email" required autoComplete="email" placeholder="you@business.com" value={email} onChange={e => setEmail(e.target.value)} />
+                </label>
+                <button type="submit" className="btn btn-accent btn-block ob-tall" disabled={!email.trim() || busy !== null}>
+                  {busy === "email" ? "Sending code…" : "Continue with email"}
+                </button>
+              </form>
+            </div>
+            {error && <p className="ob-error">{error}</p>}
+            <div className="ob-auth-alt">
+              <button
+                type="button"
+                className="ob-link"
+                disabled={busy !== null}
+                onClick={async () => {
+                  setBusy("passkey");
+                  setError(null);
+                  try {
+                    onSignedIn(await logInWithPasskey());
+                  } catch (e) {
+                    setError(passkeyMessage(e));
+                    setBusy(null);
+                  }
+                }}
+              >
+                <Fingerprint size={16} strokeWidth={1.5} /> Log in with a passkey
+              </button>
+            </div>
+            <p className="ob-auth-terms">
+              By continuing you agree to the{" "}
+              <a href="/terms" target="_blank" rel="noreferrer">
+                terms of service
+              </a>
+              .
+            </p>
+          </div>
+        ) : (
+          <div className="ob-auth-card">
+            <Title
+              lead={
+                <>
+                  We sent a 6-digit code to <strong className="ob-ink">{email.trim()}</strong>. It expires in 10 minutes.
+                </>
+              }
+            >
+              Check your email
+            </Title>
+            <CodeInput
+              value={code}
+              disabled={busy === "code"}
+              invalid={Boolean(error)}
+              onChange={v => {
+                setCode(v);
+                if (error) setError(null);
+                if (v.length === 6) void verify(v);
+              }}
+            />
+            <p className={error ? "ob-error" : "ob-muted"} aria-live="polite">
+              {error ?? (busy === "code" ? "Checking…" : "\u00a0")}
+            </p>
+            <div className="ob-auth-alt ob-auth-row">
+              <button
+                type="button"
+                className="ob-link"
+                onClick={() => {
+                  setStage("start");
+                  setError(null);
+                }}
+              >
+                Use a different email
+              </button>
+              <button type="button" className="ob-link" disabled={wait > 0 || busy !== null} onClick={() => void send()}>
+                {wait > 0 ? `Resend in ${wait}s` : "Send a new code"}
+              </button>
+            </div>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
+
+// --- protect your balance: the passkey that holds it -------------------------------------------
+
+function Secure({ m, setM, next }: StepProps) {
+  const [phase, setPhase] = useState<"idle" | "prompt" | "done">(m.has_passkey ? "done" : "idle");
+  const [error, setError] = useState<string | null>(null);
+  const [explain, setExplain] = useState(false);
+
+  const run = async () => {
     setPhase("prompt");
     setError(null);
     try {
-      const created = await signUpWithPasskey();
-      setPhase("account");
-      onDone(created);
-      // The account is derived from the passkey on the spot; this pause only lets the step read.
-      window.setTimeout(() => setPhase("done"), 600);
+      setM(await createPasskey());
+      setPhase("done");
     } catch (e) {
       setError(passkeyMessage(e));
-      setPhase("error");
+      setPhase("idle");
     }
-  }, [onDone]);
-
-  useEffect(() => {
-    if (!merchant && !started.current) {
-      started.current = true;
-      void run();
-    }
-  }, [merchant, run]);
+  };
 
   return (
     <>
-      <Title lead="Your device will ask for Face ID, your fingerprint or your PIN.">Create your passkey</Title>
-      <ul className="ob-checklist" aria-live="polite">
-        <li className={phase === "prompt" ? "is-active" : phase === "error" ? "" : "is-done"}>
-          {phase === "prompt" ? <span className="ob-dotless">…</span> : phase === "error" ? <span /> : <Check size={16} strokeWidth={1.5} />}
-          Passkey created
-        </li>
-        <li className={phase === "account" ? "is-active" : phase === "done" ? "is-done" : ""}>
-          {phase === "done" ? <Check size={16} strokeWidth={1.5} /> : <span />}
-          Setting up your balance
-        </li>
-      </ul>
-      {phase === "done" && (
-        <p className="ob-muted">
-          Your balance is ready. Only your passkeys can move money out of it.
-        </p>
+      <Title lead="Your balance is opened by a passkey on this device. Only your passkeys can move money: not your email, not Google, not Morva.">Protect your balance</Title>
+      <div className={`ob-key${phase === "done" ? " is-done" : ""}`}>
+        <span className="ob-key-icon" aria-hidden="true">
+          {phase === "done" ? <Check size={22} strokeWidth={1.5} /> : <Fingerprint size={22} strokeWidth={1.5} />}
+        </span>
+        <span className="ob-key-text">
+          <span className="ob-option-title">{phase === "done" ? "Your balance is ready" : "Passkey on this device"}</span>
+          <span className="ob-option-body" aria-live="polite">
+            {phase === "done" && m.intents_account_id ? (
+              <span className="ob-mono">
+                {m.intents_account_id.slice(0, 8)}…{m.intents_account_id.slice(-6)}
+              </span>
+            ) : phase === "prompt" ? (
+              "Follow the prompt on your device…"
+            ) : (
+              "Face ID, your fingerprint or your device PIN."
+            )}
+          </span>
+        </span>
+      </div>
+      {phase !== "done" && (
+        <div className="ob-explain">
+          <button type="button" className="ob-link ob-link-quiet" aria-expanded={explain} onClick={() => setExplain(v => !v)}>
+            What’s a passkey?
+          </button>
+          {explain && (
+            <p className="ob-popover" role="note">
+              A passkey replaces passwords. You confirm with Face ID, your fingerprint or your device PIN, and the key never leaves your device, so nobody else can
+              sign for you.
+            </p>
+          )}
+        </div>
       )}
-      {phase === "error" && (
-        <>
-          <p className="ob-error">{error}</p>
-          <div className="ob-actions">
-            <button type="button" className="btn btn-accent btn-block" onClick={() => void run()}>
-              Try again
-            </button>
-            <button type="button" className="ob-link" onClick={onBack}>
-              Back
-            </button>
-          </div>
-        </>
+      {error && <p className="ob-error">{error}</p>}
+      {phase === "done" ? (
+        <Continue onClick={() => next()} />
+      ) : (
+        <div className="ob-actions">
+          <button type="button" className="btn btn-accent btn-block" disabled={phase === "prompt"} onClick={() => void run()}>
+            {phase === "prompt" ? "Waiting for your device…" : "Create passkey"}
+          </button>
+        </div>
       )}
-      {phase === "done" && <Continue onClick={onContinue} />}
     </>
   );
 }
 
-// --- 3. business --------------------------------------------------------------------------
+// --- business --------------------------------------------------------------------------
 
 function Business({ m, setM, next }: StepProps) {
   const [name, setName] = useState(m.business_name ?? "");
@@ -356,7 +623,9 @@ function Business({ m, setM, next }: StepProps) {
           </select>
         </label>
         <div className="field">
-          Logo <span className="ob-muted">(optional)</span>
+          <span>
+            Logo <span className="ob-muted">(optional)</span>
+          </span>
           <div className="ob-logo">
             {m.logo_url ? <img src={m.logo_url} alt="" width={48} height={48} /> : <span className="ob-logo-empty" />}
             <label className="btn btn-outline btn-small">
@@ -392,7 +661,7 @@ function Business({ m, setM, next }: StepProps) {
   );
 }
 
-// --- 4. email ---------------------------------------------------------------------------------
+// --- email (only when sign-up didn’t confirm one) ---------------------------------------------------------------------------------
 
 function Email({ m, setM, next }: StepProps) {
   const [email, setEmail] = useState(m.contact_email ?? "");
@@ -464,7 +733,7 @@ function Email({ m, setM, next }: StepProps) {
   );
 }
 
-// --- 5. payout --------------------------------------------------------------------------------
+// --- payout --------------------------------------------------------------------------------
 
 function Payout({ m, setM, next }: StepProps) {
   const [mode, setMode] = useState(m.payout_mode);
@@ -544,7 +813,7 @@ function Payout({ m, setM, next }: StepProps) {
   );
 }
 
-// --- 6. how you sell -------------------------------------------------------------------------
+// --- how you sell -------------------------------------------------------------------------
 
 const CHANNELS: { id: string; label: string; body: string; soon?: boolean }[] = [
   { id: "payment_links", label: "Payment links and QR", body: "Share a link or show a QR code. Works for everyone." },
@@ -585,7 +854,7 @@ function Channels({ m, setM, next }: StepProps) {
   );
 }
 
-// --- 7. order defaults -----------------------------------------------------------------------
+// --- order defaults -----------------------------------------------------------------------
 
 function Toggle({ on, onChange, title, body }: { on: boolean; onChange: (v: boolean) => void; title: string; body: string }) {
   return (
@@ -643,7 +912,7 @@ function Defaults({ m, setM, next }: StepProps) {
   );
 }
 
-// --- 8. backup device -------------------------------------------------------------------------
+// --- backup device -------------------------------------------------------------------------
 
 function Backup({ next }: StepProps) {
   const [state, setState] = useState<"idle" | "working" | "done">("idle");
@@ -698,7 +967,7 @@ function Backup({ next }: StepProps) {
   );
 }
 
-// --- 9. terms -----------------------------------------------------------------------------------
+// --- terms -----------------------------------------------------------------------------------
 
 function Terms({ m, setM, next }: StepProps) {
   const [accepted, setAccepted] = useState(m.terms_accepted);
@@ -741,7 +1010,7 @@ function Terms({ m, setM, next }: StepProps) {
   );
 }
 
-// --- 10. test payment ------------------------------------------------------------------------
+// --- test payment ------------------------------------------------------------------------
 
 interface TestPaymentView {
   deposit_address: string;
@@ -880,7 +1149,7 @@ function TestPayment({ next }: StepProps) {
   );
 }
 
-// --- 11. live -----------------------------------------------------------------------------------
+// --- live -----------------------------------------------------------------------------------
 
 function Live({ m, setM }: StepProps) {
   const [copied, setCopied] = useState(false);

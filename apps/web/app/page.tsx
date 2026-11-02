@@ -97,9 +97,14 @@ export default function Home() {
             <a href="#events">For events</a>
             <a href="#trust">Trust</a>
           </nav>
-          <a href="#checkout" className="btn btn-small">
-            Try the checkout
-          </a>
+          <div className="site-actions">
+            <a href="/start" className="site-login">
+              Log in
+            </a>
+            <a href="/start" className="btn btn-small">
+              Get started
+            </a>
+          </div>
         </div>
       </header>
 

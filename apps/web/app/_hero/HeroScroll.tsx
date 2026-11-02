@@ -19,7 +19,7 @@ import { RoutingDiagram, type DiagramMode } from "./RoutingDiagram";
 import { Stage, STAGE_ID, SCENE_NAMES } from "./Stage";
 import { FeatureList } from "./FeatureList";
 
-const CTA_HREF = "#checkout";
+const CTA_HREF = "/start";
 const useIsoLayoutEffect = typeof window === "undefined" ? useEffect : useLayoutEffect;
 
 function useMediaQuery(query: string, serverValue: boolean) {
@@ -89,7 +89,7 @@ function HeroCopy({ style, inert }: { style?: React.ComponentProps<typeof motion
         business wants.
       </p>
       <a href={CTA_HREF} className="btn">
-        Try the checkout <ArrowRight size={18} strokeWidth={1.5} />
+        Get started <ArrowRight size={18} strokeWidth={1.5} />
       </a>
     </motion.div>
   );
