@@ -100,3 +100,77 @@ export function derToRawSignature(der: Uint8Array): Uint8Array {
 export function p256SignatureString(derSignature: Uint8Array): string {
   return `p256:${base58(toLowS(derToRawSignature(derSignature)))}`;
 }
+
+// --- browser-side helpers for passkey-signed intents ---------------------------------------
+
+function base64urlToBytes(s: string): Uint8Array {
+  const b64 = s.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(s.length / 4) * 4, "=");
+  return Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let s = "";
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s);
+}
+
+/** Nonce: magic 5628f6c6 | version 0 | 4-byte salt | deadline (u64 ns, LE) | 15 random bytes. */
+export function intentNonce(saltHex: string, deadline: Date, random15: Uint8Array = crypto.getRandomValues(new Uint8Array(15))): string {
+  if (!/^[0-9a-f]{8}$/.test(saltHex)) throw new IntentsError("invalid_request", "Salt must be 4 bytes of hex");
+  if (random15.length !== 15) throw new IntentsError("invalid_request", "Nonce needs 15 random bytes");
+  const out = new Uint8Array(32);
+  out.set([0x56, 0x28, 0xf6, 0xc6, 0x00]);
+  for (let i = 0; i < 4; i++) out[5 + i] = parseInt(saltHex.slice(i * 2, i * 2 + 2), 16);
+  let ns = BigInt(deadline.getTime()) * 1_000_000n;
+  for (let i = 0; i < 8; i++) {
+    out[9 + i] = Number(ns & 0xffn);
+    ns >>= 8n;
+  }
+  out.set(random15, 17);
+  return bytesToBase64(out);
+}
+
+export type KeyIntent = "add_public_key" | "remove_public_key";
+
+/** The payload a passkey signs to add or remove another passkey on its account. */
+export function keyIntentPayload(o: { signerId: string; intent: KeyIntent; publicKey: string; salt: string; deadline?: Date }): string {
+  const deadline = o.deadline ?? new Date(Date.now() + 10 * 60_000);
+  return JSON.stringify({
+    signer_id: o.signerId,
+    verifying_contract: "intents.near",
+    deadline: deadline.toISOString(),
+    nonce: intentNonce(o.salt, deadline),
+    intents: [{ intent: o.intent, public_key: o.publicKey }],
+  });
+}
+
+/** The WebAuthn challenge for a payload: sha256 of the exact payload string, base64url. */
+export async function payloadChallenge(payload: string): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(payload)));
+  return bytesToBase64(digest).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+export interface WebauthnSignedIntent {
+  standard: "webauthn";
+  payload: string;
+  public_key: string;
+  signature: string;
+  client_data_json: string;
+  authenticator_data: string;
+}
+
+/** Turns a WebAuthn assertion (base64url fields, as browsers and SimpleWebAuthn return them) into the Verifier's format. */
+export function webauthnSignedIntent(o: {
+  payload: string;
+  publicKeyP256: string;
+  assertion: { clientDataJSON: string; authenticatorData: string; signature: string };
+}): WebauthnSignedIntent {
+  return {
+    standard: "webauthn",
+    payload: o.payload,
+    public_key: o.publicKeyP256,
+    signature: p256SignatureString(base64urlToBytes(o.assertion.signature)),
+    client_data_json: new TextDecoder().decode(base64urlToBytes(o.assertion.clientDataJSON)),
+    authenticator_data: o.assertion.authenticatorData,
+  };
+}

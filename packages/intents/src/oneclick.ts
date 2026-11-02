@@ -101,15 +101,19 @@ export interface StatusResult {
   raw: unknown;
 }
 
-export type IntentStandard = "erc191";
+export type IntentStandard = "erc191" | "webauthn";
 export interface UnsignedIntent {
   standard: IntentStandard;
   /** The exact message the wallet signs. */
   payload: string;
 }
 export interface SignedIntent extends UnsignedIntent {
-  /** Verifier encoding, e.g. "secp256k1:<base58>"; see toVerifierErc191Signature. */
+  /** Verifier encoding, e.g. "secp256k1:<base58>" or "p256:<base58>". */
   signature: string;
+  /** webauthn only: the passkey's key and the authenticator's output, exactly as returned. */
+  public_key?: string;
+  client_data_json?: string;
+  authenticator_data?: string;
 }
 
 export interface OneClickOptions {

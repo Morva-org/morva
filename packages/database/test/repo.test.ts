@@ -10,6 +10,7 @@ import {
   deleteSession,
   findPasskeyByCredentialId,
   getSessionMerchant,
+  hitRateLimit,
   isHandleTaken,
   listAudit,
   migrate,
@@ -20,7 +21,7 @@ import {
 let db: Db;
 before(async () => {
   db = await connectMemory();
-  assert.deepEqual(await migrate(db), ["001_merchants_and_auth.sql"]);
+  assert.deepEqual(await migrate(db), ["001_merchants_and_auth.sql", "002_rate_limits_and_secret_keys.sql", "003_onboarding.sql"]);
   assert.deepEqual(await migrate(db), [], "migrations are idempotent");
 });
 after(() => db.close());
@@ -87,5 +88,17 @@ describe("sessions and challenges", () => {
     assert.equal(await consumeChallenge(db, id, "login"), null, "already used");
     const expired = await createChallenge(db, { purpose: "login", challenge: "x", expiresAt: new Date(Date.now() - 1) });
     assert.equal(await consumeChallenge(db, expired, "login"), null);
+  });
+});
+
+describe("rate limits", () => {
+  it("counts hits in a window and starts a new window once it has passed", async () => {
+    assert.equal((await hitRateLimit(db, "login:1.2.3.4", 60_000)).count, 1);
+    assert.equal((await hitRateLimit(db, "login:1.2.3.4", 60_000)).count, 2);
+    assert.equal((await hitRateLimit(db, "login:5.6.7.8", 60_000)).count, 1, "keys are independent");
+    await db.query("UPDATE rate_limit SET reset_at = now() - interval '1 second' WHERE key = 'login:1.2.3.4'");
+    const fresh = await hitRateLimit(db, "login:1.2.3.4", 60_000);
+    assert.equal(fresh.count, 1);
+    assert.ok(fresh.resetAt.getTime() > Date.now());
   });
 });

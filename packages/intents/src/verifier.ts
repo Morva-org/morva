@@ -100,3 +100,29 @@ function viewCaller({ rpcUrl = DEFAULT_NEAR_RPC_URL, fetch: fetcher = globalThis
     }
   };
 }
+
+/** The Verifier's current 4-byte nonce salt, hex (it rotates; fetch it for each intent). */
+export async function currentSalt(options: VerifierOptions = {}): Promise<string> {
+  const salt = await viewCaller(options)("current_salt", {});
+  if (typeof salt !== "string" || !/^[0-9a-f]{8}$/.test(salt)) throw new IntentsError("rpc", "current_salt returned an unexpected value");
+  return salt;
+}
+
+export type Simulation = { ok: true; logs: string[] } | { ok: false; error: string };
+
+/**
+ * Runs signed intents through `simulate_intents`: a free view call that checks signatures,
+ * nonces and balances exactly as execution would, without changing anything.
+ */
+export async function simulateIntents(signed: unknown[], options: VerifierOptions = {}): Promise<Simulation> {
+  try {
+    const result = (await viewCaller(options)("simulate_intents", { signed })) as { logs?: string[] };
+    return { ok: true, logs: result?.logs ?? [] };
+  } catch (error) {
+    if (error instanceof IntentsError && error.kind === "rpc") {
+      const panic = /panic_msg: "([^"]+)"/.exec(error.message)?.[1];
+      return { ok: false, error: panic ?? error.message };
+    }
+    throw error;
+  }
+}

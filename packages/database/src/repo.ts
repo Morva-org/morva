@@ -192,3 +192,160 @@ export async function listAudit(db: Db, merchantId: string) {
     [merchantId],
   );
 }
+
+// --- rate limits ------------------------------------------------------------------------
+
+/**
+ * Counts one hit for `key` in a fixed window, atomically. Returns the count so far and when the
+ * window resets. Expired windows restart at 1.
+ */
+export async function hitRateLimit(db: Db, key: string, windowMs: number): Promise<{ count: number; resetAt: Date }> {
+  const [row] = await db.query<{ count: number; reset_at: Date }>(
+    `INSERT INTO rate_limit (key, count, reset_at) VALUES ($1, 1, now() + make_interval(secs => $2 / 1000.0))
+     ON CONFLICT (key) DO UPDATE SET
+       count = CASE WHEN rate_limit.reset_at <= now() THEN 1 ELSE rate_limit.count + 1 END,
+       reset_at = CASE WHEN rate_limit.reset_at <= now() THEN now() + make_interval(secs => $2 / 1000.0) ELSE rate_limit.reset_at END
+     RETURNING count, reset_at`,
+    [key, windowMs],
+  );
+  return { count: row!.count, resetAt: new Date(row!.reset_at) };
+}
+
+export async function sweepRateLimits(db: Db): Promise<void> {
+  await db.query("DELETE FROM rate_limit WHERE reset_at < now()");
+}
+
+// --- onboarding -------------------------------------------------------------------------
+
+/** Merchant columns the onboarding screens may set. */
+export type MerchantPatch = Partial<
+  Pick<
+    Merchant,
+    | "handle"
+    | "business_name"
+    | "logo_url"
+    | "country"
+    | "payout_mode"
+    | "payout_chain"
+    | "payout_address"
+    | "refund_policy_default"
+    | "hold_by_default"
+    | "confidential_default"
+    | "sales_channels"
+    | "onboarding_step"
+  >
+> & { terms_accepted_at?: Date; live_at?: Date };
+
+const PATCHABLE = new Set([
+  "handle",
+  "business_name",
+  "logo_url",
+  "country",
+  "payout_mode",
+  "payout_chain",
+  "payout_address",
+  "refund_policy_default",
+  "hold_by_default",
+  "confidential_default",
+  "sales_channels",
+  "onboarding_step",
+  "terms_accepted_at",
+  "live_at",
+]);
+
+export async function updateMerchant(db: Db, id: string, patch: MerchantPatch): Promise<Merchant> {
+  const entries = Object.entries(patch).filter(([k, v]) => PATCHABLE.has(k) && v !== undefined);
+  if (entries.length === 0) return (await getMerchant(db, id))!;
+  const sets = entries.map(([k], i) => `${k} = $${i + 2}`).join(", ");
+  const [row] = await db.query<Merchant>(`UPDATE merchant SET ${sets} WHERE id = $1 RETURNING *`, [id, ...entries.map(([, v]) => v)]);
+  return row!;
+}
+
+export async function saveLogo(db: Db, merchantId: string, contentType: string, bytes: Uint8Array): Promise<void> {
+  await db.query(
+    `INSERT INTO merchant_logo (merchant_id, content_type, bytes) VALUES ($1, $2, $3)
+     ON CONFLICT (merchant_id) DO UPDATE SET content_type = EXCLUDED.content_type, bytes = EXCLUDED.bytes, updated_at = now()`,
+    [merchantId, contentType, bytes],
+  );
+}
+
+export async function getLogo(db: Db, merchantId: string): Promise<{ content_type: string; bytes: Uint8Array } | null> {
+  return (await db.query<{ content_type: string; bytes: Uint8Array }>("SELECT content_type, bytes FROM merchant_logo WHERE merchant_id = $1", [merchantId]))[0] ?? null;
+}
+
+/** A passkey added after sign-up: usable for login now, for money once the relayer registers it. */
+export async function addPasskey(db: Db, merchantId: string, p: NewPasskey): Promise<Passkey> {
+  const [row] = await db.query<Passkey>(
+    `INSERT INTO passkey (merchant_id, credential_id, public_key, public_key_p256, sign_count, transports, backed_up, device_label)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+    [merchantId, p.credentialId, p.publicKey, p.publicKeyP256, p.signCount, p.transports, p.backedUp, p.deviceLabel ?? null],
+  );
+  await recordAudit(db, merchantId, "passkey.added", { credential_id: p.credentialId, first: false });
+  return toPasskey(row!);
+}
+
+export async function markPasskeyRegistered(db: Db, merchantId: string, publicKeyP256: string): Promise<void> {
+  await db.query("UPDATE passkey SET registered_on_verifier_at = now() WHERE merchant_id = $1 AND public_key_p256 = $2 AND removed_at IS NULL", [merchantId, publicKeyP256]);
+}
+
+export async function markPasskeyRemoved(db: Db, merchantId: string, publicKeyP256: string): Promise<void> {
+  await db.query("UPDATE passkey SET removed_at = now() WHERE merchant_id = $1 AND public_key_p256 = $2 AND removed_at IS NULL", [merchantId, publicKeyP256]);
+}
+
+export async function recordRelayerSubmission(
+  db: Db,
+  s: { merchantId: string; intent: "add_public_key" | "remove_public_key"; publicKey: string; status: string; txHash?: string | null; error?: string | null },
+): Promise<void> {
+  await db.query("INSERT INTO relayer_submission (merchant_id, intent, public_key, status, tx_hash, error) VALUES ($1, $2, $3, $4, $5, $6)", [
+    s.merchantId,
+    s.intent,
+    s.publicKey,
+    s.status,
+    s.txHash ?? null,
+    s.error ?? null,
+  ]);
+}
+
+// --- test payment -----------------------------------------------------------------------
+
+export interface TestPayment {
+  id: string;
+  merchant_id: string;
+  refund_address: string;
+  deposit_address: string;
+  amount_in: string;
+  quote: Record<string, unknown>;
+  status: string;
+  received_amount: string | null;
+  refund_deposit_address: string | null;
+  refund_payload: string | null;
+  refund_intent_hash: string | null;
+  refund_status: string | null;
+  created_at: Date;
+}
+
+export async function createTestPayment(
+  db: Db,
+  t: { merchantId: string; refundAddress: string; depositAddress: string; amountIn: string; quote: unknown },
+): Promise<TestPayment> {
+  const [row] = await db.query<TestPayment>(
+    "INSERT INTO test_payment (merchant_id, refund_address, deposit_address, amount_in, quote) VALUES ($1, $2, $3, $4, $5) RETURNING *",
+    [t.merchantId, t.refundAddress, t.depositAddress, t.amountIn, JSON.stringify(t.quote)],
+  );
+  return row!;
+}
+
+export async function latestTestPayment(db: Db, merchantId: string): Promise<TestPayment | null> {
+  return (await db.query<TestPayment>("SELECT * FROM test_payment WHERE merchant_id = $1 ORDER BY created_at DESC LIMIT 1", [merchantId]))[0] ?? null;
+}
+
+export async function updateTestPayment(
+  db: Db,
+  id: string,
+  patch: Partial<Pick<TestPayment, "status" | "received_amount" | "refund_deposit_address" | "refund_payload" | "refund_intent_hash" | "refund_status">>,
+): Promise<TestPayment> {
+  const entries = Object.entries(patch).filter(([, v]) => v !== undefined);
+  const sets = [...entries.map(([k], i) => `${k} = $${i + 2}`), "updated_at = now()"].join(", ");
+  const [row] = await db.query<TestPayment>(`UPDATE test_payment SET ${sets} WHERE id = $1 RETURNING *`, [id, ...entries.map(([, v]) => v)]);
+  return row!;
+}

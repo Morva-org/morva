@@ -1,5 +1,5 @@
-// Fixed-window rate limits, in memory. Fine for one API instance; move to Postgres or Redis
-// before running more than one.
+// Fixed-window rate limits, stored in Postgres so they hold across instances and restarts.
+import { hitRateLimit, sweepRateLimits, type Db } from "@morva/database";
 
 export interface Limit {
   max: number;
@@ -7,29 +7,20 @@ export interface Limit {
 }
 
 export class RateLimiter {
-  private hits = new Map<string, { count: number; resetAt: number }>();
-  private now: () => number;
+  private db: Db;
+  private hits = 0;
 
-  constructor(now: () => number = Date.now) {
-    this.now = now;
+  constructor(db: Db) {
+    this.db = db;
   }
 
   /** Counts one hit for `key`. Returns the seconds to wait if the limit is exceeded. */
-  hit(key: string, limit: Limit): { ok: true } | { ok: false; retryAfter: number } {
-    const t = this.now();
-    let entry = this.hits.get(key);
-    if (!entry || entry.resetAt <= t) {
-      entry = { count: 0, resetAt: t + limit.windowMs };
-      this.hits.set(key, entry);
-    }
-    entry.count++;
-    if (entry.count > limit.max) return { ok: false, retryAfter: Math.ceil((entry.resetAt - t) / 1000) };
-    if (this.hits.size > 50_000) this.sweep(t);
+  async hit(key: string, limit: Limit): Promise<{ ok: true } | { ok: false; retryAfter: number }> {
+    const { count, resetAt } = await hitRateLimit(this.db, key, limit.windowMs);
+    // Expired rows are cleared now and then, off the request's critical path.
+    if (++this.hits % 500 === 0) void sweepRateLimits(this.db).catch(() => {});
+    if (count > limit.max) return { ok: false, retryAfter: Math.max(1, Math.ceil((resetAt.getTime() - Date.now()) / 1000)) };
     return { ok: true };
-  }
-
-  private sweep(t: number) {
-    for (const [k, v] of this.hits) if (v.resetAt <= t) this.hits.delete(k);
   }
 }
 
@@ -39,4 +30,9 @@ export const LIMITS = {
   emailSend: { max: 5, windowMs: 60 * 60_000 },
   emailVerify: { max: 10, windowMs: 10 * 60_000 },
   handleCheck: { max: 120, windowMs: 60_000 },
+  onboarding: { max: 120, windowMs: 60_000 },
+  logo: { max: 10, windowMs: 60 * 60_000 },
+  addDevice: { max: 10, windowMs: 60 * 60_000 },
+  relayer: { max: 10, windowMs: 60 * 60_000 },
+  testPayment: { max: 20, windowMs: 60 * 60_000 },
 } satisfies Record<string, Limit>;

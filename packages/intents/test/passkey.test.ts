@@ -46,3 +46,39 @@ describe("passkey signatures", () => {
     assert.throws(() => derToRawSignature(Uint8Array.from([0x31, 0x00])), /DER/);
   });
 });
+
+describe("passkey intents", async () => {
+  const { intentNonce, keyIntentPayload, payloadChallenge, webauthnSignedIntent } = await import("../src/index.ts");
+
+  it("builds the salted nonce layout the Verifier expects", () => {
+    const n = Buffer.from(intentNonce("252812b3", new Date("2026-11-02T10:00:00Z"), new Uint8Array(15).fill(7)), "base64");
+    assert.equal(n.length, 32);
+    assert.equal(n.subarray(0, 9).toString("hex"), "5628f6c600252812b3");
+    assert.equal(n.readBigUInt64LE(9), BigInt(Date.parse("2026-11-02T10:00:00Z")) * 1_000_000n);
+    assert.ok(n.subarray(17).every(b => b === 7));
+    assert.throws(() => intentNonce("xyz", new Date()), /Salt/);
+  });
+
+  it("builds an add_public_key payload for the account", () => {
+    const p = JSON.parse(keyIntentPayload({ signerId: "0xabc", intent: "add_public_key", publicKey: "p256:K", salt: "252812b3" }));
+    assert.equal(p.signer_id, "0xabc");
+    assert.equal(p.verifying_contract, "intents.near");
+    assert.deepEqual(p.intents, [{ intent: "add_public_key", public_key: "p256:K" }]);
+  });
+
+  it("uses sha256 of the payload as the challenge and keeps the assertion intact", async () => {
+    assert.equal(await payloadChallenge("abc"), "ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0");
+    const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+    const der = sign("sha256", Buffer.from("m"), privateKey);
+    const signed = webauthnSignedIntent({
+      payload: "P",
+      publicKeyP256: "p256:K",
+      assertion: { clientDataJSON: Buffer.from('{"type":"webauthn.get"}').toString("base64url"), authenticatorData: "AAAA", signature: der.toString("base64url") },
+    });
+    assert.equal(signed.standard, "webauthn");
+    assert.equal(signed.payload, "P");
+    assert.equal(signed.client_data_json, '{"type":"webauthn.get"}');
+    assert.equal(signed.authenticator_data, "AAAA");
+    assert.equal(signed.signature, p256SignatureString(der));
+  });
+});

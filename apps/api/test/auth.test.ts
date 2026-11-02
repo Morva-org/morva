@@ -4,7 +4,6 @@ import { connectMemory, listAudit, migrate, type Db } from "@morva/database";
 import { p256AccountId, rawP256FromCoordinates } from "@morva/intents";
 import { createApp, SESSION_COOKIE } from "../src/app.ts";
 import type { Config } from "../src/config.ts";
-import { RateLimiter } from "../src/rate-limit.ts";
 import { SoftAuthenticator } from "./soft-authenticator.ts";
 
 const config: Config = {
@@ -30,7 +29,6 @@ beforeEach(async () => {
     db,
     config,
     mailer: { sendVerificationCode: async (to, code) => void sent.push({ to, code }) },
-    limiter: new RateLimiter(),
   });
 });
 after(() => db?.close());

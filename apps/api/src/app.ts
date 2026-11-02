@@ -33,10 +33,12 @@ import {
   type Merchant,
 } from "@morva/database";
 import { normalizeHandle, validateHandle } from "@morva/domain";
-import { p256AccountId, p256PublicKeyString, rawP256FromCoordinates } from "@morva/intents";
+import { p256AccountId, p256PublicKeyString, rawP256FromCoordinates, type OneClickClient } from "@morva/intents";
 import type { Config } from "./config.ts";
 import type { Mailer } from "./mailer.ts";
 import { LIMITS, RateLimiter, type Limit } from "./rate-limit.ts";
+import { registerOnboarding } from "./onboarding.ts";
+import type { Relayer } from "./relayer.ts";
 
 export const SESSION_COOKIE = "morva_session";
 const ES256 = -7;
@@ -51,12 +53,15 @@ export interface Deps {
   config: Config;
   mailer: Mailer;
   limiter?: RateLimiter;
+  relayer?: Relayer | null;
+  oneclick?: OneClickClient | null;
+  verifierRpcUrl?: string;
 }
 
 const sha256 = (data: string | Uint8Array) => createHash("sha256").update(data).digest();
 const b64url = (bytes: Uint8Array) => Buffer.from(bytes).toString("base64url");
 
-export function createApp({ db, config, mailer, limiter = new RateLimiter() }: Deps) {
+export function createApp({ db, config, mailer, limiter = new RateLimiter(db), relayer = null, oneclick = null, verifierRpcUrl }: Deps) {
   const app = new Hono<Env>();
 
   // Client IP, for rate limits. Behind a proxy, only trusted when configured.
@@ -80,8 +85,8 @@ export function createApp({ db, config, mailer, limiter = new RateLimiter() }: D
     return c.json({ error: "internal" }, 500);
   });
 
-  const limit = (c: Context<Env>, name: keyof typeof LIMITS, key: string, l: Limit = LIMITS[name]) => {
-    const r = limiter.hit(`${name}:${key}`, l);
+  const limit = async (c: Context<Env>, name: keyof typeof LIMITS, key: string, l: Limit = LIMITS[name]) => {
+    const r = await limiter.hit(`${name}:${key}`, l);
     if (r.ok) return null;
     c.header("Retry-After", String(r.retryAfter));
     return c.json({ error: "rate_limited", retry_after: r.retryAfter }, 429);
@@ -116,7 +121,7 @@ export function createApp({ db, config, mailer, limiter = new RateLimiter() }: D
   // --- sign-up: create a passkey, derive the merchant's NEAR Intents account -------------
 
   app.post("/v1/auth/register/options", async c => {
-    const limited = limit(c, "register", c.get("ip"));
+    const limited = await limit(c, "register", c.get("ip"));
     if (limited) return limited;
     const userId = randomBytes(16);
     const options = await generateRegistrationOptions({
@@ -139,7 +144,7 @@ export function createApp({ db, config, mailer, limiter = new RateLimiter() }: D
   });
 
   app.post("/v1/auth/register/verify", async c => {
-    const limited = limit(c, "register", c.get("ip"));
+    const limited = await limit(c, "register", c.get("ip"));
     if (limited) return limited;
     const body = await c.req.json<{ challengeId?: string; response?: RegistrationResponseJSON; deviceLabel?: string }>().catch(() => ({}) as never);
     if (!body.challengeId || !body.response) return c.json({ error: "invalid_request" }, 400);
@@ -186,7 +191,7 @@ export function createApp({ db, config, mailer, limiter = new RateLimiter() }: D
   // --- log in with a passkey -----------------------------------------------------------
 
   app.post("/v1/auth/login/options", async c => {
-    const limited = limit(c, "login", c.get("ip"));
+    const limited = await limit(c, "login", c.get("ip"));
     if (limited) return limited;
     // Discoverable credentials: the browser offers whichever Morva passkeys are on the device.
     const options = await generateAuthenticationOptions({ rpID: config.rpId, userVerification: "required", allowCredentials: [] });
@@ -195,7 +200,7 @@ export function createApp({ db, config, mailer, limiter = new RateLimiter() }: D
   });
 
   app.post("/v1/auth/login/verify", async c => {
-    const limited = limit(c, "login", c.get("ip"));
+    const limited = await limit(c, "login", c.get("ip"));
     if (limited) return limited;
     const body = await c.req.json<{ challengeId?: string; response?: AuthenticationResponseJSON }>().catch(() => ({}) as never);
     if (!body.challengeId || !body.response) return c.json({ error: "invalid_request" }, 400);
@@ -245,7 +250,7 @@ export function createApp({ db, config, mailer, limiter = new RateLimiter() }: D
 
   // Handle availability, for the live check on the business screen.
   app.get("/v1/handles/:handle", async c => {
-    const limited = limit(c, "handleCheck", c.get("ip"));
+    const limited = await limit(c, "handleCheck", c.get("ip"));
     if (limited) return limited;
     const handle = normalizeHandle(c.req.param("handle"));
     const valid = validateHandle(handle);
@@ -260,7 +265,7 @@ export function createApp({ db, config, mailer, limiter = new RateLimiter() }: D
 
   app.post("/v1/me/email", requireMerchant, async c => {
     const merchant = c.get("merchant");
-    const limited = limit(c, "emailSend", merchant.id);
+    const limited = await limit(c, "emailSend", merchant.id);
     if (limited) return limited;
     const { email } = await c.req.json<{ email?: string }>().catch(() => ({}) as { email?: string });
     const clean = email?.trim().toLowerCase() ?? "";
@@ -273,7 +278,7 @@ export function createApp({ db, config, mailer, limiter = new RateLimiter() }: D
 
   app.post("/v1/me/email/verify", requireMerchant, async c => {
     const merchant = c.get("merchant");
-    const limited = limit(c, "emailVerify", merchant.id);
+    const limited = await limit(c, "emailVerify", merchant.id);
     if (limited) return limited;
     const { code } = await c.req.json<{ code?: string }>().catch(() => ({}) as { code?: string });
     const pending = await latestEmailCode(db, merchant.id);
@@ -286,6 +291,8 @@ export function createApp({ db, config, mailer, limiter = new RateLimiter() }: D
     await setContactEmail(db, merchant.id, pending.email);
     return c.json({ verified: true, email: pending.email });
   });
+
+  registerOnboarding(app, { db, config, limit, requireMerchant, publicMerchant, relayer, oneclick, verifierRpcUrl });
 
   return app;
 }
