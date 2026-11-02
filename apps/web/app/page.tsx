@@ -12,9 +12,11 @@ import {
 import { CheckoutStory } from "./_checkout/CheckoutStory";
 import { HeroScroll } from "./_hero/HeroScroll";
 import { ProblemGrid } from "./_problems/ProblemGrid";
+import { Atlas } from "./_how/Atlas";
 import { MorvaMark } from "./MorvaMark";
+import { SITE, SITE_URL } from "./site-config";
 
-const REPO = "https://github.com/Morva-org/morva";
+const REPO = SITE.github;
 const icon = { size: 24, strokeWidth: 1.5 } as const;
 
 const problems = [
@@ -50,9 +52,39 @@ const trust = [
   { title: "Caps until audited", body: "The escrow contract runs with per-order and per-day limits on mainnet until it has been audited." },
 ];
 
+// Structured data for search engines: who Morva is and what this site is. No product or offer
+// types, because nothing is for sale yet.
+const jsonLd = {
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "Organization",
+      "@id": `${SITE_URL}/#organization`,
+      name: SITE.name,
+      url: `${SITE_URL}/`,
+      logo: `${SITE_URL}/apple-icon.png`,
+      description: SITE.description,
+      sameAs: [SITE.github],
+    },
+    {
+      "@type": "WebSite",
+      "@id": `${SITE_URL}/#website`,
+      url: `${SITE_URL}/`,
+      name: SITE.name,
+      description: SITE.tagline,
+      publisher: { "@id": `${SITE_URL}/#organization` },
+      inLanguage: "en",
+    },
+  ],
+};
+
 export default function Home() {
   return (
     <>
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd).replace(/</g, "\\u003c") }}
+      />
       <header className="site-header">
         <div className="container">
           <a href="#top" className="wordmark" aria-label="Morva home">
@@ -106,27 +138,11 @@ export default function Home() {
           </div>
         </section>
 
-        <section className="section" id="how-it-works" aria-labelledby="how-title">
-          <div className="container">
-            <div className="section-head">
-              <h2 id="how-title" className="section-title">
-                How it works
-              </h2>
-              <p className="section-lead">
-                NEAR Intents and its 1Click API do the routing. Morva turns a route into a payment a business can run
-                on.
-              </p>
-            </div>
-            <ol className="steps" style={{ listStyle: "none", margin: 0, padding: 0 }}>
-              {steps.map((s, i) => (
-                <li className="card" key={s.title}>
-                  <span className="step-num">{i + 1}</span>
-                  <h3 className="card-title">{s.title}</h3>
-                  <p className="muted">{s.body}</p>
-                </li>
-              ))}
-            </ol>
-          </div>
+        <section className="atlas-section" id="how-it-works" aria-labelledby="how-title">
+          <Atlas
+            steps={steps}
+            subline="NEAR Intents and its 1Click API do the routing. Morva turns a route into a payment a business can run on."
+          />
         </section>
 
         <section className="section" aria-labelledby="commerce-title">

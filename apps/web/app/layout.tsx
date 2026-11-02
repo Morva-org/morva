@@ -1,19 +1,53 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import "@fontsource/inter/400.css";
 import "@fontsource/inter/600.css";
 import "./site.css";
-
-const description =
-  "Morva lets any business get paid by anyone holding crypto, from any wallet, on any chain, in the currency the business wants. Built on NEAR Intents.";
-const socialImage = { url: "/section/og.png", width: 1200, height: 630, alt: "A Morva pass receiving one payment from three chains" };
+import { INDEXABLE, SITE, SITE_URL } from "./site-config";
 
 export const metadata: Metadata = {
-  // Set NEXT_PUBLIC_SITE_URL to the production domain so social images get absolute URLs.
-  metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000"),
-  title: "Morva — Every wallet. Every chain. One way to get paid.",
-  description,
-  openGraph: { title: "Morva", description, images: [socialImage] },
-  twitter: { card: "summary_large_image", images: [socialImage] },
+  metadataBase: new URL(SITE_URL),
+  title: { default: SITE.title, template: `%s · ${SITE.name}` },
+  description: SITE.description,
+  applicationName: SITE.name,
+  keywords: [
+    "crypto payments",
+    "accept crypto",
+    "crypto checkout",
+    "stablecoin payments",
+    "USDC payments",
+    "NEAR Intents",
+    "multi-chain payments",
+    "refund to source",
+    "crypto event ticketing",
+  ],
+  authors: [{ name: SITE.name, url: SITE.github }],
+  creator: SITE.name,
+  category: "finance",
+  alternates: { canonical: "/" },
+  openGraph: {
+    type: "website",
+    url: "/",
+    siteName: SITE.name,
+    title: SITE.title,
+    description: SITE.description,
+    locale: "en_US",
+    images: [SITE.socialImage],
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: SITE.title,
+    description: SITE.description,
+    images: [SITE.socialImage],
+  },
+  robots: INDEXABLE
+    ? { index: true, follow: true, googleBot: { index: true, follow: true, "max-image-preview": "large" } }
+    : { index: false, follow: false },
+  formatDetection: { telephone: false, email: false, address: false },
+};
+
+export const viewport: Viewport = {
+  themeColor: SITE.themeColor,
+  colorScheme: "light",
 };
 
 export default function RootLayout({
