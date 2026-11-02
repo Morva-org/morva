@@ -298,6 +298,49 @@ function GoogleG() {
 
 const RESEND_AFTER_S = 30;
 
+// Footage: "Person Using Her Smartphone For Electronic Payment" by Marcus Aurelius, Pexels
+// (free to use, pexels.com/video/4109600). Only seconds 2–14 show the payment, so we loop those.
+const CLIP = { from: 2, to: 14 };
+
+/** The sign-in panel's background: the poster on its own, the clip on wide screens with motion allowed. */
+function PanelMedia() {
+  const ref = useRef<HTMLVideoElement>(null);
+  const [play, setPlay] = useState(false);
+
+  useEffect(() => {
+    const wide = window.matchMedia("(min-width: 960px)");
+    const calm = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const update = () => setPlay(wide.matches && !calm.matches);
+    update();
+    wide.addEventListener("change", update);
+    calm.addEventListener("change", update);
+    return () => {
+      wide.removeEventListener("change", update);
+      calm.removeEventListener("change", update);
+    };
+  }, []);
+
+  return (
+    <div className="ob-auth-media" aria-hidden="true">
+      <img src="/start/paying.jpg" alt="" />
+      {play && (
+        <video
+          ref={ref}
+          src={`/start/paying.mp4#t=${CLIP.from}`}
+          muted
+          autoPlay
+          playsInline
+          preload="auto"
+          onCanPlay={e => e.currentTarget.classList.add("is-ready")}
+          onTimeUpdate={e => {
+            if (e.currentTarget.currentTime >= CLIP.to) e.currentTarget.currentTime = CLIP.from;
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
 function Auth({ onSignedIn }: { onSignedIn: (m: Merchant) => void }) {
   const [google, setGoogle] = useState(false);
   const [stage, setStage] = useState<"start" | "code">("start");
@@ -355,8 +398,9 @@ function Auth({ onSignedIn }: { onSignedIn: (m: Merchant) => void }) {
   return (
     <div className="ob ob-auth">
       <aside className="ob-auth-panel">
+        <PanelMedia />
         <span className="ob-brand">
-          <MorvaMark size={24} /> morva
+          <MorvaMark size={24} ink="#FFFFFF" /> morva
         </span>
         <div className="ob-auth-pitch">
           <h2>Take crypto payments from any chain. Keep USDC.</h2>
