@@ -11,7 +11,8 @@
     "dev": "npm run dev --workspace=@morva/web",
     "build": "npm run build --workspace=@morva/web",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "test": "npm test --workspaces --if-present && npm run test:spike"
+    "test": "npm test --workspaces --if-present && npm run test:spike",
+    "spike:passkey": "node scripts/passkey-account-spike.mjs"
   },
   "devDependencies": {
     "viem": "2.56.9"

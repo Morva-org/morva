@@ -66,6 +66,33 @@ Sources: the [1Click OpenAPI spec](https://1click.chaindefuser.com/docs/v0/opena
 11. **Status has more states than the PRD lists.** `/v0/status` returns `KNOWN_DEPOSIT_TX`, `PENDING_DEPOSIT`, `INCOMPLETE_DEPOSIT`, `PROCESSING`, `SUCCESS`, `REFUNDED` and `FAILED`. `INCOMPLETE_DEPOSIT` is the natural trigger for `underpaid`. `POST /v0/deposit/submit` can speed up detection when the buyer's wallet gives us the tx hash.
 12. **erc191 has two encoding details.** The signature must be `secp256k1:` + base58(r‖s‖v), with `v` normalized from 27/28 to 0/1. `signer_id` is the 0x address. Both are covered by unit tests.
 
+### Merchant accounts: passkeys (2 November 2026)
+
+Evidence: `npm run spike:passkey -- --oneclick`. The script emulates a platform passkey and runs real signed payloads through `simulate_intents` on `intents.near` (contract 0.4.3). That's a free view call: nothing is executed or stored, and no funds move. 10 of 10 checks pass. **Decision: a merchant's passkey-derived implicit account (option A).**
+
+13. **A passkey is a NEAR Intents account on its own.** For P-256 keys the Verifier derives `"0x" + hex(keccak256("p256" ‖ x ‖ y)[12..32])`. We checked this against the source's test vector.
+    - `has_public_key` is already true for that pair. There's no registration, no transaction and no per-merchant cost.
+    - The ID is fixed by the first passkey and never changes.
+    - It's also the merchant's 1Click `recipient`, lowercased (finding 10).
+14. **The PRD's named-account option would make Morva custodial.** NEAR access keys can't be P-256, so a `<handle>.morva.near` account needs a non-passkey key to create it and register the passkey. That key would be Morva's, and while it exists Morva could register its own key and move funds. Each account would also cost about 0.0018 NEAR. Rejected.
+15. **Passkey signing has strict encoding rules.**
+    - Use `standard: "webauthn"`, with `public_key` and `signature` as `p256:` + base58 of the raw 64-byte key or of r‖s.
+    - The browser challenge must be sha256 of the exact payload string, and `client_data_json` and `authenticator_data` must be sent exactly as returned.
+    - The origin isn't checked, and the user-verified flag isn't enforced on-chain. Morva requires `userVerification: "required"` and ES256 in the browser, and sets the relying party ID to Morva's own domain.
+16. **Signatures must be low-S.** Authenticators return either valid S value. The Verifier rejected about half of the raw signatures and all of the low-S ones. The client normalises S to n − S before submitting.
+17. **Nonces embed a rotating salt.** The 32-byte nonce is: magic `5628f6c6`, version `00`, the contract's `current_salt` (4 bytes, rotates), the deadline as u64 nanoseconds little-endian, then 15 random bytes. Fetch the salt for each intent.
+18. **Money moves through 1Click; key changes need a relayer.**
+    - **Through 1Click:** `generate-intent` with `standard: "webauthn"` returns a payload the passkey can sign (checked with a real quote, nothing submitted). Withdrawals and payments are quote, generate-intent, passkey signature, then `submit-intent`.
+    - **Through a relayer:** adding or removing a passkey (`add_public_key` / `remove_public_key`) isn't a swap, so 1Click can't submit it. A minimal Morva relayer submits those signed intents and pays NEAR gas. Its key can't move merchant funds.
+19. **Backup devices work and can revoke a lost original.** A backup passkey added by signed intent has full control and can remove the first passkey (`public_key_removed`). "You can't remove your last device" is a Morva rule.
+20. **There is no testnet.** `intents.testnet` and `defuse.testnet` have no contract, and 1Click is mainnet-only.
+    - **Signing paths:** tested free with `simulate_intents` on mainnet.
+    - **Full flows:** run on mainnet with a dedicated test merchant, capped by `MAX_TEST_SPEND_USD`.
+    - **CI:** uses a mocked Verifier.
+21. **Non-custodial means no automatic refunds or payouts from a merchant balance.** Only the merchant's passkey can move it.
+    - **Test-payment refund:** one passkey-confirmed tap.
+    - **"Send automatically to my wallet":** settles each payment straight to the merchant's wallet at checkout (`recipientType: DESTINATION_CHAIN`). Refunds after payment then aren't possible from Morva. Holds use the escrow contract for every merchant.
+
 ## Exit criteria
 
 Gate 1 passes when:
