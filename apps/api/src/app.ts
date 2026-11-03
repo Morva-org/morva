@@ -44,6 +44,7 @@ import {
 } from "@morva/database";
 import { normalizeHandle, validateHandle } from "@morva/domain";
 import { p256AccountId, p256PublicKeyString, rawP256FromCoordinates, type OneClickClient } from "@morva/intents";
+import { defaultBalanceReader, registerDashboard, type BalanceReader } from "./dashboard.ts";
 import type { Config } from "./config.ts";
 import type { Mailer } from "./mailer.ts";
 import { LIMITS, RateLimiter, type Limit } from "./rate-limit.ts";
@@ -66,12 +67,14 @@ export interface Deps {
   relayer?: Relayer | null;
   oneclick?: OneClickClient | null;
   verifierRpcUrl?: string;
+  /** Reads a NEAR Intents balance; defaults to the Verifier over RPC. For tests. */
+  readBalances?: BalanceReader;
 }
 
 const sha256 = (data: string | Uint8Array) => createHash("sha256").update(data).digest();
 const b64url = (bytes: Uint8Array) => Buffer.from(bytes).toString("base64url");
 
-export function createApp({ db, config, mailer, limiter = new RateLimiter(db), relayer = null, oneclick = null, verifierRpcUrl }: Deps) {
+export function createApp({ db, config, mailer, limiter = new RateLimiter(db), relayer = null, oneclick = null, verifierRpcUrl, readBalances = defaultBalanceReader(verifierRpcUrl) }: Deps) {
   const app = new Hono<Env>();
 
   // Client IP, for rate limits. Behind a proxy, only trusted when configured.
@@ -411,6 +414,7 @@ export function createApp({ db, config, mailer, limiter = new RateLimiter(db), r
   });
 
   registerOnboarding(app, { db, config, limit, requireMerchant, publicMerchant, relayer, oneclick, verifierRpcUrl });
+  registerDashboard(app, { db, config, limit, publicMerchant, requireMerchant, oneclick, readBalances });
 
   return app;
 }

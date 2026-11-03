@@ -35,4 +35,5 @@ export const LIMITS = {
   addDevice: { max: 10, windowMs: 60 * 60_000 },
   relayer: { max: 10, windowMs: 60 * 60_000 },
   testPayment: { max: 20, windowMs: 60 * 60_000 },
+  moneyAction: { max: 20, windowMs: 60 * 60_000 },
 } satisfies Record<string, Limit>;

@@ -118,6 +118,15 @@ export async function signWithPasskey(payload: string, signers: Signer[], rpId: 
   return webauthnSignedIntent({ payload, publicKeyP256: signer.public_key_p256, assertion: assertion.response });
 }
 
+export type PayoutChange = { mode: "keep_in_balance" } | { mode: "auto_payout"; chain: string; address: string };
+
+/** Changes where payouts go. The passkey confirms exactly this change; the server checks it. */
+export async function changePayout(change: PayoutChange): Promise<Merchant> {
+  const { challengeId, options } = await api<{ challengeId: string; options: Parameters<typeof startAuthentication>[0]["optionsJSON"] }>("POST", "/me/payout/options", change);
+  const response = await startAuthentication({ optionsJSON: options });
+  return (await api<{ merchant: Merchant }>("POST", "/me/payout", { ...change, challengeId, response })).merchant;
+}
+
 /** Backup device: create a second passkey, then have the first one authorise it on NEAR Intents. */
 export async function addBackupDevice(rpId: string): Promise<void> {
   const { challengeId, options } = await api<{ challengeId: string; options: Parameters<typeof startRegistration>[0]["optionsJSON"] }>("POST", "/me/passkeys/options");
