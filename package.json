@@ -2,13 +2,23 @@
   "name": "morva",
   "private": true,
   "workspaces": [
-    "apps/web"
+    "apps/web",
+    "apps/api",
+    "packages/intents",
+    "packages/domain",
+    "packages/database"
   ],
   "scripts": {
     "spike:payments": "node scripts/payment-spike.mjs",
     "test:spike": "node --test scripts/payment-spike.test.mjs",
     "dev": "npm run dev --workspace=@morva/web",
+    "dev:api": "npm run dev --workspace=@morva/api",
     "build": "npm run build --workspace=@morva/web",
-    "typecheck": "npm run typecheck --workspace=@morva/web"
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm test --workspaces --if-present && npm run test:spike",
+    "spike:passkey": "node scripts/passkey-account-spike.mjs"
+  },
+  "devDependencies": {
+    "viem": "2.56.9"
   }
 }
